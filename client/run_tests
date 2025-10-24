@@ -1,0 +1,49 @@
+#!/bin/bash
+
+set -x
+
+#Build local docker file
+echo "Building dockerfile..."
+./build_docker
+
+#TMP dir for test_data
+TMPFILE=`mktemp`
+trap "rm -f $TMPFILE" EXIT
+error() {
+  echo "ERROR: $*"
+  exit 1
+}
+
+#Simple test_data
+cd test_data
+echo "Checking rio-stac integration..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C --assets-rio-stac -u test -p test -c test --item-datetime '20010101T000000Z' /test_data/GeogToWGS84GeoKey5.tif > $TMPFILE
+diff $TMPFILE GeogToWGS84GeoKey5.expected_stac
+[[ $? -ne 0 ]] && error "RIO-STAC test failed"
+
+echo "Check invalid size..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-datetime '20010101T000000Z' /test_data/GeogToWGS84GeoKey5.invalid_size
+[[ $? -ne 0 ]] || error "Invalid size test failed"
+
+echo "Check invalid checksum..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-datetime '20010101T000000Z' /test_data/GeogToWGS84GeoKey5.invalid_checksum
+[[ $? -ne 0 ]] || error "Invalid checksum test failed"
+
+echo "Check calculate checksum and generate type..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-datetime '20010101T000000Z' /test_data/GeogToWGS84GeoKey5.no_checksum_no_type > $TMPFILE
+diff $TMPFILE GeogToWGS84GeoKey5.expected_stac
+[[ $? -ne 0 ]] && error "Checksum and size addition failed"
+
+echo "Check item data regex"
+docker run --rm -v $PWD:/test-data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-date-regex 'Test_(?P<sY>[0-9]{4})' /test-data/Test_20010205_20230301_data.tif > $TMPFILE
+diff $TMPFILE Test_20010205_20230301_data.expected200101
+[[ $? -ne 0 ]] && error "Item data regex test failed"
+
+docker run --rm -v $PWD:/test-data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-date-regex 'Test_(?P<sY>[0-9]{4})(?P<sm>[0-9]{2})' /test-data/Test_20010205_20230301_data.tif > $TMPFILE
+diff $TMPFILE Test_20010205_20230301_data.expected200102
+[[ $? -ne 0 ]] && error "Item data regex test failed"
+
+docker run --rm -v $PWD:/test-data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-date-regex 'Test_(?P<sY>[0-9]{4})(?P<sm>[0-9]{2})(?P<sD>[0-9]{2})_(?P<eY>[0-9]{4})' /test-data/Test_20010205_20230301_data.tif > $TMPFILE
+diff $TMPFILE Test_20010205_20230301_data.expected200102_2023
+[[ $? -ne 0 ]] && error "Item data regex test failed"
+
