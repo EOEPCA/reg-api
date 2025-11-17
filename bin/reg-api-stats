@@ -222,15 +222,15 @@ def status():
         print("Daemon is not running.")
 
 
-def run_job(force_coll=None):
+def run_job(force_colls=[]):
     """The main task to be run."""
     log("Starting stats update...")
     try:
-        run_job_internal(force_coll)
+        run_job_internal(force_colls)
     except Exception as e:
         log(f"ERROR stats updates failed. Error: {e}")
 
-def run_job_internal(force_coll=None):
+def run_job_internal(force_colls=[]):
   #Do stats update
   #Load config file every time, so we get change updates
   cfg=load_yaml(CFGFILE)
@@ -238,10 +238,10 @@ def run_job_internal(force_coll=None):
   stats_folder=cfg['stats']['stats_folder']
   del cfg
 
-  collist=[]
-  if force_coll:
-    collist.append(force_coll)
+  if len(force_colls)>0:
+    collist=force_colls
   else:
+    collist=[]
     with os.scandir(stac_folder) as it:
       for entry in it:
         if entry.is_dir(follow_symlinks=False):
@@ -551,7 +551,7 @@ def check_collection(coll_name):
   return {"numProducts":numProducts,"numAssets":numAssets,"numDataAssets":numDataAssets,"totalSize":totalSize,"errorProducts":errorProducts}
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or ( len(sys.argv) == 3 and sys.argv[1].lower() != "run" ):
+    if len(sys.argv) < 2:
         print("Usage: reg-api-stats [start|stop|status|run]")
         sys.exit(1)
 
@@ -564,12 +564,13 @@ if __name__ == "__main__":
     elif command == "status":
         status()
     elif command == "run":
-        if len(sys.argv) == 3:
+        #Force full run (good for testing and next upgade)
+        LOG_FILE='/dev/stdout'
+        if len(sys.argv) > 2:
           #Force single run
-          run_job(sys.argv[2])
+          colls=sys.argv[2:]
+          run_job(colls)
         else:
-          #Force full run (good for testing and next upgade)
-          LOG_FILE='/dev/stdout'
           run_job()
     else:
         print("Unknown command. Use start, stop, status or run.")
