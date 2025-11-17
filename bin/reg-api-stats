@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""
+reg-api-stats: Create statistics and perform checks on ingested datasets
+
+Usage:
+    ./reg-api-stats.py start
+    ./reg-api-stats.py stop
+    ./reg-api-stats.py status
+"""
+
+import os
+import sys
+import time
+import signal
+import json
+from datetime import datetime, timedelta
+import hashlib
+import zipfile
+import stat
+
+#Set current folder to the current script path
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+#Load configuration file
+##We avoid to use pyyaml here, as we have a very simple YAML file
+def read_simple_yaml(path):
+    """
+    Read a minimal YAML file with:
+        group:
+          key: value
+    Returns a dict of dicts.
+    """
+    data = {}
+    current_group = None
+
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+
+            # Skip blank lines and comments
+            if not line or line.startswith('#'):
+                continue
+
+            # Group header
+            if line.endswith(':') and not line.startswith(' '):
+                current_group = line[:-1].strip()
+                data[current_group] = {}
+                continue
+
+            # Key-value line inside a group
+            if current_group and ':' in line:
+                key, value = line.split(':', 1)
+                data[current_group][key.strip()] = value.strip()
+                continue
+
+            # If badly formatted, you could raise an error
+            # raise ValueError(f"Invalid YAML line: {line}")
+
+    return data
+
+def load_yaml(cfgfile):
+  cfg=read_simple_yaml(cfgfile)
+  #with open(cfgfile,'r') as f:
+  #  cfg=yaml.safe_load(f)
+  return cfg
+
+def load_conf():
+  CURPATH = os.path.dirname(os.path.realpath(__file__))
+  CFGPATH = os.path.realpath(os.path.join(CURPATH,"../cfg"))
+  CFGFILE = os.path.join(CFGPATH,"conf.yaml")
+  cfg=load_yaml(CFGFILE)['stats']
+  cfg['config_path']=CFGPATH
+  return cfg
+
+conf = load_conf()
+PID_FILE=conf['pid']
+LOG_FILE=conf['logfile']
+CRON_STR=conf['cron']
+CFGPATH=conf['config_path']
+CFGFILE = os.path.join(CFGPATH,"conf.yaml")
+del conf
+
+def log(message: str):
+    """Append a timestamped message to the log file."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{timestamp}] {message}\n")
+
+def daemonize():
+    """Detach process from terminal and run in background."""
+    if os.fork() > 0:
+        sys.exit(0)  # Exit parent
+
+    log("Starting daemon...")
+    os.setsid()
+
+    if os.fork() > 0:
+        sys.exit(0)  # Exit first child
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    # Redirect standard file descriptors
+    with open("/dev/null", "rb", 0) as f:
+        os.dup2(f.fileno(), sys.stdin.fileno())
+    with open("/dev/null", "ab", 0) as f:
+        os.dup2(f.fileno(), sys.stdout.fileno())
+        os.dup2(f.fileno(), sys.stderr.fileno())
+
+    # Write PID file
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    log("Daemon started.")
+    run_daemon()
+
+def parse_cron_field(field: str, min_value: int, max_value: int):
+    """Parse a single cron field into a set of valid integer values."""
+    values = set()
+    for part in field.split(','):
+        if part == '*':
+            values.update(range(min_value, max_value + 1))
+        elif part.startswith('*/'):
+            step = int(part[2:])
+            values.update(range(min_value, max_value + 1, step))
+        elif '-' in part:
+            start, end = map(int, part.split('-'))
+            values.update(range(start, end + 1))
+        else:
+            values.add(int(part))
+    return values
+
+def next_cron_datetime(cron_expr: str, start_time = None) -> datetime:
+    """
+    Compute the next datetime that matches the given 5-field cron expression.
+    
+    Supports: minute, hour, day of month, month, day of week.
+    """
+    if start_time is None:
+        start_time = datetime.utcnow().replace(second=0, microsecond=0)
+    else:
+        start_time = start_time.replace(second=0, microsecond=0)
+
+    minute_field, hour_field, dom_field, month_field, dow_field = cron_expr.split()
+
+    minutes = parse_cron_field(minute_field, 0, 59)
+    hours = parse_cron_field(hour_field, 0, 23)
+    days = parse_cron_field(dom_field, 1, 31)
+    months = parse_cron_field(month_field, 1, 12)
+    dows = parse_cron_field(dow_field, 0, 6)  # 0=Sunday
+
+    candidate = start_time + timedelta(minutes=1)
+
+    while True:
+        if (candidate.minute in minutes and
+            candidate.hour in hours and
+            candidate.day in days and
+            candidate.month in months and
+            candidate.weekday() in dows):
+            return candidate
+
+        candidate += timedelta(minutes=1)
+
+def get_next_run_time():
+    """Return datetime of next scheduled run."""
+
+    now = datetime.now()
+    next_run = next_cron_datetime(CRON_STR, now)
+
+    return next_run
+
+def run_daemon():
+    """Main loop for daemon."""
+    signal.signal(signal.SIGTERM, handle_exit)
+    
+    while True:
+        next_run = get_next_run_time()
+        next_run_interval_s = round((next_run - datetime.now()).total_seconds())
+        log(f"Next run scheduled at {next_run}. In {next_run_interval_s} seconds.")
+        time.sleep(next_run_interval_s)
+        run_job()
+
+def handle_exit(signum, frame):
+    """Handle SIGTERM for clean shutdown."""
+    log("Daemon stopping...")
+    if os.path.exists(PID_FILE):
+        os.remove(PID_FILE)
+    log("Daemon stopped.")
+    sys.exit(0)
+
+
+def start():
+    if os.path.exists(PID_FILE):
+        print("Daemon already running.")
+        sys.exit(1)
+
+    daemonize()
+
+def stop():
+    if not os.path.exists(PID_FILE):
+        print("Daemon not running.")
+        return
+
+    with open(PID_FILE, "r") as f:
+        pid = int(f.read().strip())
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print("Daemon stopped.")
+    except ProcessLookupError:
+        print("Process not found. Removing stale PID file.")
+    finally:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+
+def status():
+    if os.path.exists(PID_FILE):
+        with open(PID_FILE, "r") as f:
+            pid = f.read().strip()
+        print(f"Daemon is running (PID: {pid})")
+    else:
+        print("Daemon is not running.")
+
+
+def run_job(force_coll=None):
+    """The main task to be run."""
+    log("Starting stats update...")
+    try:
+        run_job_internal(force_coll)
+    except Exception as e:
+        log(f"ERROR stats updates failed. Error: {e}")
+
+def run_job_internal(force_coll=None):
+  #Do stats update
+  #Load config file every time, so we get change updates
+  cfg=load_yaml(CFGFILE)
+  stac_folder=os.path.join(cfg['config']['datastore_folder'],cfg['config']['stac_subfolder'])
+  stats_folder=cfg['stats']['stats_folder']
+  del cfg
+
+  collist=[]
+  if force_coll:
+    collist.append(force_coll)
+  else:
+    with os.scandir(stac_folder) as it:
+      for entry in it:
+        if entry.is_dir(follow_symlinks=False):
+          collist.append(entry.name)
+  log(f"{len(collist)} collections to scan!")
+  
+  #Scan collection and write stats file
+  for c in collist:
+    stats_file=os.path.join(stats_folder,c+'.json')
+    stats = check_collection(c)
+    with open(stats_file, 'w') as f:
+      json.dump(stats,f, ensure_ascii=False)
+    log(f"Updated stats file {stats_file}")
+  
+  log("Stats retreival complete")
+
+
+def verify_multihash(filepath,multihash):
+  # Multihash format: <hash code><digest length><digest>
+  # SHA2-256 code: 0x12, digest length: 32 bytes
+  #Get function from hash code
+  try:
+    mh = bytes.fromhex(multihash)
+  except Exception:
+    return False
+  algo_code = mh[0]
+  digest = mh[2:]
+  if algo_code == 0x11:
+    h = hashlib.sha1()
+  elif algo_code == 0x12:
+    h = hashlib.sha256()
+  elif algo_code == 0x13:
+    h = hashlib.sha512()
+  else:
+    return False
+  with open(filepath, 'rb') as f:
+    for chunk in iter(lambda: f.read(8192), b''):
+      h.update(chunk)
+  return h.digest() == digest
+
+#Returns
+#0 format recommended and valid
+#1 format recommended and invalid
+#2 format cannot be checked
+def verify_fileformat(filepath,fmt):
+  if fmt.startswith('image/tiff'):
+    #We recommend geotiff or cogs. Check it is valid geotiff
+    try:
+      with open(filepath, 'rb') as f:
+        # Read TIFF header
+        header = f.read(8)
+        if len(header) < 8:
+          return 1
+        # Determine endianness
+        if header[:2] == b'II':
+          endian = '<'  # little endian
+        elif header[:2] == b'MM':
+          endian = '>'  # big endian
+        else:
+          return 1
+        # Check TIFF magic number (42)
+        magic = struct.unpack(endian + 'H', header[2:4])[0]
+        if magic != 42:
+          return 1
+        # Get offset to first IFD
+        ifd_offset = struct.unpack(endian + 'I', header[4:8])[0]
+        # Traverse IFDs
+        while ifd_offset != 0:
+          f.seek(ifd_offset)
+          # Number of directory entries
+          num_entries_bytes = f.read(2)
+          if len(num_entries_bytes) < 2:
+            return 1
+          num_entries = struct.unpack(endian + 'H', num_entries_bytes)[0]
+          # Read all directory entries
+          entries_bytes = f.read(num_entries * 12)
+          if len(entries_bytes) < num_entries * 12:
+            return 1
+          for i in range(num_entries):
+            entry = entries_bytes[i*12:(i+1)*12]
+            tag = struct.unpack(endian + 'H', entry[:2])[0]
+            if tag == 34735:
+              return 0  # Found GeoTIFF tag
+          # Get offset to next IFD
+          next_ifd_bytes = f.read(4)
+          if len(next_ifd_bytes) < 4:
+            return 1
+          ifd_offset = struct.unpack(endian + 'I', next_ifd_bytes)[0]
+        # If we traversed all IFDs and didn't find the tag
+        return 1
+    except Exception:
+      return 1
+  elif fmt.startswith('application/x-zarr'):
+    #For Zarr, we check if it is valid
+    try:
+      if os.path.isdir(filepath):
+        zarray_path = os.path.join(filepath, '.zarray')
+        if not os.path.isfile(zarray_path): return 1
+        with open(zarray_path, 'r') as f:
+          data = json.load(f)
+          required_keys = {'zarr_format', 'shape', 'chunks', 'dtype'}
+          if not required_keys.issubset(data.keys()):
+            return 1
+        zgroup_path = os.path.join(filepath, '.zgroup')
+        if not os.path.isfile(zgroup_path): return 1
+        with open(zgroup_path, 'r') as f:
+          data = json.load(f)
+          if 'zarr_format' not in data:
+            return 1
+        return 0
+      else:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+          namelist = zf.namelist()
+        validated_zarray=False
+        validated_zgroup=False
+        for n in namelist:
+          if validated_zarray or n.endswith('.zarray'):
+            with zf.open(n) as f:
+              data = json.load(f)
+            required_keys = {'zarr_format', 'shape', 'chunks', 'dtype'}
+            if not required_keys.issubset(data.keys()):
+              return 1
+            validated_zarray=True
+          if validated_zgroup or n.endswith('.zgroup'):
+            with zf.open(n) as f:
+              data = json.load(f)
+            if 'zarr_format' not in data:
+              return 1
+            validated_zgroup=True
+          if validated_zarray and validated_zgroup:
+            return 0
+        return 1
+    except Exception:
+      return 1
+  else:
+    return 2
+
+def get_directory_size(path):
+    """
+    Fast recursive directory size calculation using os.scandir().
+    Returns size in bytes.
+    """
+    total_size = 0
+
+    def scan_dir(p):
+        nonlocal total_size
+        try:
+            with os.scandir(p) as it:
+                for entry in it:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            total_size += entry.stat(follow_symlinks=False).st_size
+                        elif entry.is_dir(follow_symlinks=False):
+                            scan_dir(entry.path)
+                    except OSError:
+                        # Skip files/directories we can't access
+                        pass
+        except OSError:
+            # Skip directories we can't access
+            pass
+
+    scan_dir(path)
+    return total_size
+
+#Error codes returned. Criticals are lower than 0x60
+# 0x00  All valid (no error provided)
+# 0x01  Invalid JSON
+# 0x02  No assets of type data
+# 0x60  Asset is a remote asset
+# 0x03  Assets not found on disk
+# 0x04  Asset size not found in JSON
+# 0x05  Asset size mismatch on disk
+# 0x61  Asset checksum not found in JSON
+# 0x06  Asset checksum mismatch on disk
+# 0x07  Asset format not found in JSON
+# 0x08  Asset format mismatch on disk
+# 0x62  Asset format is not recommended format (and cannot be validated)
+def check_product(stac_path,product_assets_path):
+  #Open the JSON file. If it is invalid, we have a problem
+  try:
+    with open(stac_path,'r') as f:
+      stac_item = json.load(f)
+  except Exception as e:
+    return (0,0,0,{0:[0x01]})
+  #Check if there are no assets
+  if 'assets' not in stac_item:
+    return (0,0,0,{0:[0x02]})
+  #Check assets (record number of type data assets as there should be at least one
+  num_data_assets=0
+  num_assets=0
+  size_assets=0
+  errors={}
+  for asset_name in stac_item['assets']:
+    num_assets=num_assets+1
+    asset=stac_item['assets'][asset_name]
+    #Check if the asset is of data type
+    asset_is_data=False
+    if 'roles' in asset and 'data' in asset['roles']:
+      num_data_assets=num_data_assets+1
+      asset_is_data=True
+    #Check if asset is local or not
+    if 'href' not in asset or asset['href'][0]!='/':
+      errors.setdefault(asset_name, []).append(0x60)
+      continue
+    #Check if asset is on disk
+    asset_file=os.path.join(product_assets_path,asset['href'].split('/')[-1])
+    try:
+      asset_stat=os.stat(asset_file,follow_symlinks=False)
+    except Exception as e:
+      errors.setdefault(asset_name, []).append(0x03)
+      continue
+    #Get asset size
+    if stat.S_ISDIR(asset_stat.st_mode):
+      asset_size=get_directory_size(asset_file)
+    else:
+      asset_size=asset_stat.st_size
+    size_assets=size_assets+asset_size
+    #Check asset size
+    if 'file:size' not in asset:
+      errors.setdefault(asset_name, []).append(0x04)
+      continue
+    if asset['file:size'] != asset_size:
+      print(asset_size)
+      errors.setdefault(asset_name, []).append(0x05)
+      continue
+    #Check asset checksum
+    if 'file:checksum' not in asset:
+      errors.setdefault(asset_name, []).append(0x61)
+    elif not verify_multihash(asset_file,asset['file:checksum']):
+      errors.setdefault(asset_name, []).append(0x06)
+      continue
+    #Check asset format type exists
+    if 'type' not in asset:
+      errors.setdefault(asset_name, []).append(0x07)
+      continue
+    #Check asset format is valid (only for data roles)
+    if asset_is_data:
+      asset_fmt_check=verify_fileformat(asset_file,asset['type'])
+      if asset_fmt_check==1:
+        errors.setdefault(asset_name, []).append(0x08)
+        continue
+      elif asset_fmt_check==2:
+        errors.setdefault(asset_name, []).append(0x62)
+
+  if num_data_assets==0:
+    errors[0]=[0x02]
+
+  return (num_assets,num_data_assets,size_assets,errors)
+
+#Checks a collection for assets correctness, will store any error found in the errorlog file, will return the total size of the 
+def check_collection(coll_name):
+  log(f"Scanning collection {coll_name}")
+  #Load config file every time, so we get change updates
+  cfg=load_yaml(CFGFILE)['config']
+  asset_folder=os.path.join(cfg['datastore_folder'],cfg['assets_subfolder'])
+  stac_folder=os.path.join(cfg['datastore_folder'],cfg['stac_subfolder'])
+  stac_folder_len=len(stac_folder)
+  del cfg
+  #Get the stac folder path for the collection
+  path=os.path.join(stac_folder,coll_name)
+  #Total size and number of products to be returned
+  totalSize=0
+  numProducts=0
+  numAssets=0
+  numDataAssets=0
+  errorProducts={}
+  #For the JSON folders by reg-api, you always have a path which is year/month/day
+  with os.scandir(path) as it:
+    #First level, year, no file should be here
+    for entry in it:
+      if entry.is_file(follow_symlinks=False):
+        raise(f"ERROR: Invalid STAC folder. There should be no file at {path}/{entry.name}")
+      elif entry.is_dir(follow_symlinks=False):
+        #Second level, month, again no file should be here
+        path2=os.path.join(path,entry.name)
+        with os.scandir(path2) as it2:
+          for entry2 in it2:
+            if entry2.is_file(follow_symlinks=False):
+              raise(f"ERROR: Invalid STAC folder. There should be no file at {path2}/{entry2.name}")
+            elif entry2.is_dir(follow_symlinks=False):
+              #Third level, day, again no file should be here
+              path3=os.path.join(path2,entry2.name)
+              with os.scandir(path3) as it3:
+                for entry3 in it3:
+                  if entry3.is_file(follow_symlinks=False):
+                    raise(f"ERROR: Invalid STAC folder. There should be no file at {path3}/{entry3.name}")
+                  elif entry3.is_dir(follow_symlinks=False):
+                    #Forth level, product, only files here no directories
+                    path4=os.path.join(path3,entry3.name)
+                    path4_assets=asset_folder+path4[stac_folder_len:]
+                    with os.scandir(path4) as it4:
+                      for entry4 in it4:
+                        if entry4.is_file(follow_symlinks=False):
+                          #Check product assets, return number of assets and size of assets
+                          path5=os.path.join(path4,entry4.name)
+                          path5_assets=os.path.join(path4_assets,entry4.name)
+                          product_check_results=check_product(path5,path5_assets)
+                          numAssets=numAssets+product_check_results[0]
+                          numDataAssets=numDataAssets+product_check_results[1]
+                          totalSize=totalSize+product_check_results[2]
+                          numProducts=numProducts+1
+                          if len(product_check_results[3])>0:
+                            errorProducts[entry4.name]=product_check_results[3]
+                        elif entry4.is_dir(follow_symlinks=False):
+                          raise(f"ERROR: Invalid STAC folder. There should be no directory at {path4}/{entry4.name}")
+  #return result
+  return {"numProducts":numProducts,"numAssets":numAssets,"numDataAssets":numDataAssets,"totalSize":totalSize,"errorProducts":errorProducts}
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2 or ( len(sys.argv) == 3 and sys.argv[1].lower() != "run" ):
+        print("Usage: reg-api-stats [start|stop|status|run]")
+        sys.exit(1)
+
+    command = sys.argv[1].lower()
+
+    if command == "start":
+        start()
+    elif command == "stop":
+        stop()
+    elif command == "status":
+        status()
+    elif command == "run":
+        if len(sys.argv) == 3:
+          #Force single run
+          run_job(sys.argv[2])
+        else:
+          #Force full run (good for testing and next upgade)
+          LOG_FILE='/dev/stdout'
+          run_job()
+    else:
+        print("Unknown command. Use start, stop, status or run.")
+        sys.exit(1)
