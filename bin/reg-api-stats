@@ -246,6 +246,10 @@ def run_job_internal(force_colls=[]):
       for entry in it:
         if entry.is_dir(follow_symlinks=False):
           collist.append(entry.name)
+    collist_file=os.path.join(stats_folder,'collections.list')
+    with open(collist_file,'w') as f:
+      json.dump(collist,f)
+    log(f"Collection list written to {collist_file}")
   log(f"{len(collist)} collections to scan!")
   
   #Scan collection and write stats file
@@ -406,29 +410,29 @@ def get_directory_size(path):
     scan_dir(path)
     return total_size
 
-#Error codes returned. Criticals are lower than 0x60
-# 0x00  All valid (no error provided)
-# 0x01  Invalid JSON
-# 0x02  No assets of type data
-# 0x60  Asset is a remote asset
-# 0x03  Assets not found on disk
-# 0x04  Asset size not found in JSON
-# 0x05  Asset size mismatch on disk
-# 0x61  Asset checksum not found in JSON
-# 0x06  Asset checksum mismatch on disk
-# 0x07  Asset format not found in JSON
-# 0x08  Asset format mismatch on disk
-# 0x62  Asset format is not recommended format (and cannot be validated)
+#Error codes returned. Criticals are lower than 100
+# 0   All valid (no error provided)
+# 1   Invalid JSON
+# 2   No assets of type data
+# 100 Asset is a remote asset
+# 3   Assets not found on disk
+# 4   Asset size not found in JSON
+# 5   Asset size mismatch on disk
+# 101 Asset checksum not found in JSON
+# 6   Asset checksum mismatch on disk
+# 7   Asset format not found in JSON
+# 8   Asset format mismatch on disk
+# 102 Asset format is not recommended format (and cannot be validated)
 def check_product(stac_path,product_assets_path):
   #Open the JSON file. If it is invalid, we have a problem
   try:
     with open(stac_path,'r') as f:
       stac_item = json.load(f)
   except Exception as e:
-    return (0,0,0,{0:[0x01]})
+    return (0,0,0,{0:[1]})
   #Check if there are no assets
   if 'assets' not in stac_item:
-    return (0,0,0,{0:[0x02]})
+    return (0,0,0,{0:[2]})
   #Check assets (record number of type data assets as there should be at least one
   num_data_assets=0
   num_assets=0
@@ -444,14 +448,14 @@ def check_product(stac_path,product_assets_path):
       asset_is_data=True
     #Check if asset is local or not
     if 'href' not in asset or asset['href'][0]!='/':
-      errors.setdefault(asset_name, []).append(0x60)
+      errors.setdefault(asset_name, []).append(100)
       continue
     #Check if asset is on disk
     asset_file=os.path.join(product_assets_path,asset['href'].split('/')[-1])
     try:
       asset_stat=os.stat(asset_file,follow_symlinks=False)
     except Exception as e:
-      errors.setdefault(asset_name, []).append(0x03)
+      errors.setdefault(asset_name, []).append(3)
       continue
     #Get asset size
     if stat.S_ISDIR(asset_stat.st_mode):
@@ -461,33 +465,32 @@ def check_product(stac_path,product_assets_path):
     size_assets=size_assets+asset_size
     #Check asset size
     if 'file:size' not in asset:
-      errors.setdefault(asset_name, []).append(0x04)
-      continue
-    if asset['file:size'] != asset_size:
+      errors.setdefault(asset_name, []).append(4)
+    elif asset['file:size'] != asset_size:
       print(asset_size)
-      errors.setdefault(asset_name, []).append(0x05)
+      errors.setdefault(asset_name, []).append(5)
       continue
     #Check asset checksum
     if 'file:checksum' not in asset:
-      errors.setdefault(asset_name, []).append(0x61)
+      errors.setdefault(asset_name, []).append(101)
     elif not verify_multihash(asset_file,asset['file:checksum']):
-      errors.setdefault(asset_name, []).append(0x06)
+      errors.setdefault(asset_name, []).append(6)
       continue
     #Check asset format type exists
     if 'type' not in asset:
-      errors.setdefault(asset_name, []).append(0x07)
+      errors.setdefault(asset_name, []).append(7)
       continue
     #Check asset format is valid (only for data roles)
     if asset_is_data:
       asset_fmt_check=verify_fileformat(asset_file,asset['type'])
       if asset_fmt_check==1:
-        errors.setdefault(asset_name, []).append(0x08)
+        errors.setdefault(asset_name, []).append(8)
         continue
       elif asset_fmt_check==2:
-        errors.setdefault(asset_name, []).append(0x62)
+        errors.setdefault(asset_name, []).append(102)
 
   if num_data_assets==0:
-    errors[0]=[0x02]
+    errors[0]=[2]
 
   return (num_assets,num_data_assets,size_assets,errors)
 
@@ -508,26 +511,27 @@ def check_collection(coll_name):
   numAssets=0
   numDataAssets=0
   errorProducts={}
+  errorSummary=[0]*255
   #For the JSON folders by reg-api, you always have a path which is year/month/day
   with os.scandir(path) as it:
     #First level, year, no file should be here
     for entry in it:
       if entry.is_file(follow_symlinks=False):
-        raise(f"ERROR: Invalid STAC folder. There should be no file at {path}/{entry.name}")
+        raise(Exception("Invalid STAC folder. There should be no file at {path}/{entry.name}"))
       elif entry.is_dir(follow_symlinks=False):
         #Second level, month, again no file should be here
         path2=os.path.join(path,entry.name)
         with os.scandir(path2) as it2:
           for entry2 in it2:
             if entry2.is_file(follow_symlinks=False):
-              raise(f"ERROR: Invalid STAC folder. There should be no file at {path2}/{entry2.name}")
+              raise(Exception(f"ERROR: Invalid STAC folder. There should be no file at {path2}/{entry2.name}"))
             elif entry2.is_dir(follow_symlinks=False):
               #Third level, day, again no file should be here
               path3=os.path.join(path2,entry2.name)
               with os.scandir(path3) as it3:
                 for entry3 in it3:
                   if entry3.is_file(follow_symlinks=False):
-                    raise(f"ERROR: Invalid STAC folder. There should be no file at {path3}/{entry3.name}")
+                    raise(Exception(f"ERROR: Invalid STAC folder. There should be no file at {path3}/{entry3.name}"))
                   elif entry3.is_dir(follow_symlinks=False):
                     #Forth level, product, only files here no directories
                     path4=os.path.join(path3,entry3.name)
@@ -545,10 +549,14 @@ def check_collection(coll_name):
                           numProducts=numProducts+1
                           if len(product_check_results[3])>0:
                             errorProducts[entry4.name]=product_check_results[3]
+                          for err_asset in product_check_results[3]:
+                            err_codes = product_check_results[3][err_asset]
+                            for ecode in err_codes:
+                              errorSummary[ecode]+=1
                         elif entry4.is_dir(follow_symlinks=False):
-                          raise(f"ERROR: Invalid STAC folder. There should be no directory at {path4}/{entry4.name}")
+                          raise(Exception(f"ERROR: Invalid STAC folder. There should be no directory at {path4}/{entry4.name}"))
   #return result
-  return {"numProducts":numProducts,"numAssets":numAssets,"numDataAssets":numDataAssets,"totalSize":totalSize,"errorProducts":errorProducts}
+  return {"numProducts":numProducts,"numAssets":numAssets,"numDataAssets":numDataAssets,"totalSize":totalSize,"errorSummary":{k: v for k,v in enumerate(errorSummary) if v>0},"errorProducts":errorProducts}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
