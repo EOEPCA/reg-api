@@ -18,6 +18,7 @@ import hashlib
 import zipfile
 import stat
 import argparse
+import subprocess
 
 #Set current folder to the current script path
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -301,50 +302,10 @@ def calculate_multihash(filepath):
 def verify_fileformat(filepath,fmt):
   fmt_beginning=fmt.split(';',1)[0]
   if fmt_beginning=='image/tiff':
-    #We recommend geotiff or cogs. Check it is valid geotiff
+    #We recommend geotiff or cogs. Check it is valid geotiff using GDAL
     try:
-      with open(filepath, 'rb') as f:
-        # Read TIFF header
-        header = f.read(8)
-        if len(header) < 8:
-          return 1
-        # Determine endianness
-        if header[:2] == b'II':
-          endian = '<'  # little endian
-        elif header[:2] == b'MM':
-          endian = '>'  # big endian
-        else:
-          return 1
-        # Check TIFF magic number (42)
-        magic = struct.unpack(endian + 'H', header[2:4])[0]
-        if magic != 42:
-          return 1
-        # Get offset to first IFD
-        ifd_offset = struct.unpack(endian + 'I', header[4:8])[0]
-        # Traverse IFDs
-        while ifd_offset != 0:
-          f.seek(ifd_offset)
-          # Number of directory entries
-          num_entries_bytes = f.read(2)
-          if len(num_entries_bytes) < 2:
-            return 1
-          num_entries = struct.unpack(endian + 'H', num_entries_bytes)[0]
-          # Read all directory entries
-          entries_bytes = f.read(num_entries * 12)
-          if len(entries_bytes) < num_entries * 12:
-            return 1
-          for i in range(num_entries):
-            entry = entries_bytes[i*12:(i+1)*12]
-            tag = struct.unpack(endian + 'H', entry[:2])[0]
-            if tag == 34735:
-              return 0  # Found GeoTIFF tag
-          # Get offset to next IFD
-          next_ifd_bytes = f.read(4)
-          if len(next_ifd_bytes) < 4:
-            return 1
-          ifd_offset = struct.unpack(endian + 'I', next_ifd_bytes)[0]
-        # If we traversed all IFDs and didn't find the tag
-        return 1
+      gdalinfo=json.loads(subprocess.check_output(['gdalinfo','-json',filepath]).decode('utf-8'))
+      if 'driverLongName' not in gdalinfo or gdalinfo['driverLongName']!='GeoTIFF': return 1
     except Exception:
       return 1
   elif fmt_beginning in ['application/x-zarr','application/vnd+zarr','application/zip+zarr']:
@@ -450,6 +411,7 @@ def fix_product(stac_path,fixed_stac_item):
 # 7   Asset format not found in JSON
 # 8   Asset format mismatch on disk
 # 102 Asset format is not recommended format (and cannot be validated)
+# 103 Collection is empty (NOTE: this is an error at collection level not product level)
 def check_product(stac_path,product_assets_path):
   #Open the JSON file. If it is invalid, we have a problem
   try:
@@ -460,12 +422,22 @@ def check_product(stac_path,product_assets_path):
   #Check if there are no assets
   if 'assets' not in stac_item:
     return (0,0,0,{0:[2]})
+  #Apply fix to datarole if requested
+  product_needs_fix=False
+  if 'fix_add_datarole' in args and args.fix_add_datarole is not None:
+    if args.fix_add_datarole in stac_item['assets']:
+      el=stac_item['assets'][args.fix_add_datarole]
+      if 'roles' not in el:
+        el['roles']=['data']
+      elif 'data' not in asset['roles']:
+        el['roles']+=['data']
+      del el
+      product_needs_fix=True
   #Check assets (record number of type data assets as there should be at least one
   num_data_assets=0
   num_assets=0
   size_assets=0
   errors={}
-  product_needs_fix=False
   for asset_name in stac_item['assets']:
     num_assets=num_assets+1
     asset=stac_item['assets'][asset_name]
@@ -603,8 +575,11 @@ def check_collection(coll_name):
                               errorSummary[ecode]+=1
                         elif entry4.is_dir(follow_symlinks=False):
                           raise(Exception(f"ERROR: Invalid STAC folder. There should be no directory at {path4}/{entry4.name}"))
-  #return result
-  return {"numProducts":numProducts,"numAssets":numAssets,"numDataAssets":numDataAssets,"totalSize":totalSize,"errorSummary":{k: v for k,v in enumerate(errorSummary) if v>0},"errorProducts":errorProducts}
+  #Flag collection-level issue of empty collection as a warning
+  if numProducts==0:
+    errorSummary[103]=-1
+  #Return result
+  return {"numProducts":numProducts,"numAssets":numAssets,"numDataAssets":numDataAssets,"totalSize":totalSize,"errorSummary":{k: v for k,v in enumerate(errorSummary) if v!=0},"errorProducts":errorProducts}
 
 #Main
 parser = argparse.ArgumentParser(description="Offline checks on registered collections.")
@@ -617,13 +592,25 @@ parser_status = subparsers.add_parser('status', help='Check deamon status.')
 parser_status.set_defaults(command='status')
 parser_run = subparsers.add_parser('run', help='Run in standalone mode. Good for testing, debug and fixing operations')
 parser_run.set_defaults(command='run')
-parser_run.add_argument('--fix-script-prefix', type=str, default='metadata', help='Prefix for the generated fix scripts. Defaults to the local folder')
+parser_run.add_argument('--fix-script-prefix', type=str, default='metadata', metavar='<prefix>', help='Prefix for the generated fix scripts. Defaults to the local folder')
 parser_run.add_argument('--fix-missing-size', action='store_true', help='Fix missing file:size metadata, set it to current file size from disk. USE WITH CAUTION!')
 parser_run.add_argument('--fix-size-mismatch', action='store_true', help='Fix file:size metadata mismatch on disk, override current and set it to file size from disk. USE WITH CAUTION!')
 parser_run.add_argument('--fix-missing-checksum', action='store_true', help='Fix missing file:checksum metadata, set it to current file size from disk. USE WITH CAUTION!')
 parser_run.add_argument('--fix-checksum-mismatch', action='store_true', help='Fix file:checksum metadata mismatch on disk, set it to current file checks from disk. USE WITH CAUTION!')
+parser_run.add_argument('--fix-add-datarole', type=str, default=None, metavar='<assetname>', help='Add data role to asset <assetname>. Useful for fixing missing data role. USE WITH CAUTION!')
+
 parser_run.add_argument('colls',nargs='*', help='Collections to perfom checks. If not set, all will be used')
 args=parser.parse_args()
+
+#Check gdalinfo avaliability, as it is required for checks on validity of data formats
+try:
+  a=subprocess.check_output(['gdalinfo','--version']).decode('utf-8')
+  if not a.startswith('GDAL '):
+    raise(Exception("Invalid GDAL version"))
+  del a
+except Exception as e:
+  print("ERROR: Cannot find gdalinfo or version incorrect. Please install gdalinfo as it is a requirement for assets file format checks"+str(e))
+  exit(1)
 
 if args.command == "start":
   start()
