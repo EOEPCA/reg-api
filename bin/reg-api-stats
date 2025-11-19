@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 import hashlib
 import zipfile
 import stat
+import argparse
 
 #Set current folder to the current script path
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -286,12 +287,20 @@ def verify_multihash(filepath,multihash):
       h.update(chunk)
   return h.digest() == digest
 
+def calculate_multihash(filepath):
+  h = hashlib.sha256()
+  with open(filepath, 'rb') as f:
+    for chunk in iter(lambda: f.read(8192), b''):
+      h.update(chunk)
+  return '1220'+h.hexdigest()
+
 #Returns
 #0 format recommended and valid
 #1 format recommended and invalid
 #2 format cannot be checked
 def verify_fileformat(filepath,fmt):
-  if fmt.startswith('image/tiff'):
+  fmt_beginning=fmt.split(';',1)[0]
+  if fmt_beginning=='image/tiff':
     #We recommend geotiff or cogs. Check it is valid geotiff
     try:
       with open(filepath, 'rb') as f:
@@ -338,17 +347,15 @@ def verify_fileformat(filepath,fmt):
         return 1
     except Exception:
       return 1
-  elif fmt.startswith('application/x-zarr'):
+  elif fmt_beginning in ['application/x-zarr','application/vnd+zarr','application/zip+zarr']:
     #For Zarr, we check if it is valid
     try:
       if os.path.isdir(filepath):
-        zarray_path = os.path.join(filepath, '.zarray')
-        if not os.path.isfile(zarray_path): return 1
+        zattrs_path = os.path.join(filepath, '.zattrs')
+        if not os.path.isfile(zattrs_path): return 1
         with open(zarray_path, 'r') as f:
           data = json.load(f)
-          required_keys = {'zarr_format', 'shape', 'chunks', 'dtype'}
-          if not required_keys.issubset(data.keys()):
-            return 1
+          del data
         zgroup_path = os.path.join(filepath, '.zgroup')
         if not os.path.isfile(zgroup_path): return 1
         with open(zgroup_path, 'r') as f:
@@ -357,28 +364,17 @@ def verify_fileformat(filepath,fmt):
             return 1
         return 0
       else:
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-          namelist = zf.namelist()
-        validated_zarray=False
-        validated_zgroup=False
-        for n in namelist:
-          if validated_zarray or n.endswith('.zarray'):
-            with zf.open(n) as f:
-              data = json.load(f)
-            required_keys = {'zarr_format', 'shape', 'chunks', 'dtype'}
-            if not required_keys.issubset(data.keys()):
-              return 1
-            validated_zarray=True
-          if validated_zgroup or n.endswith('.zgroup'):
-            with zf.open(n) as f:
-              data = json.load(f)
+        with zipfile.ZipFile(filepath, 'r') as zf:
+          with zf.open('.zgroup') as f:
+            data = json.load(f)
             if 'zarr_format' not in data:
               return 1
-            validated_zgroup=True
-          if validated_zarray and validated_zgroup:
-            return 0
-        return 1
-    except Exception:
+            del data
+          with zf.open('.zattrs') as f:
+            data = json.load(f)
+          return 0
+    except Exception as e:
+      print(e)
       return 1
   else:
     return 2
@@ -410,6 +406,37 @@ def get_directory_size(path):
     scan_dir(path)
     return total_size
 
+fix_file=None
+unfix_file=None
+diff_file=None
+fix_file_num=0
+def fix_product(stac_path,fixed_stac_item):
+  #Write a batch file to apply fix and to revert it
+  global fix_file, unfix_file, diff_file, fix_file_num
+  fprefix=args.fix_script_prefix
+  if fix_file is None:
+    fix_file=open(f'{fprefix}.all.fix','w')
+    unfix_file=open(f'{fprefix}.all.unfix','w')
+    diff_file=open(f'{fprefix}.all.diff','w')
+    fix_file.write("#!/bin/bash\n#This script applies patches to the metadata\n")
+    unfix_file.write("#!/bin/bash\n#This script reverts the patches applied to the metadata\n")
+    diff_file.write("#!/bin/bash\n#This script shows the patches to be applied\n")
+  #Write the new stac file
+  with open(f"{fprefix}.{fix_file_num}.fix",'w') as f:
+    json.dump(fixed_stac_item,f)
+  os.system(f"cp '{stac_path}' '{fprefix}.{fix_file_num}.unfix'")
+  fix_file.write(f"cp -f '{fprefix}.{fix_file_num}.fix' '{stac_path}'\n")
+  unfix_file.write(f"cp -f '{fprefix}.{fix_file_num}.unfix' '{stac_path}'\n")
+  #Push new stac file to the catalogue
+  cfg=load_yaml(CFGFILE)['config']
+  cat_req_url=f"{cfg['catalogue_address']}/{fixed_stac_item['collection']}/items/{fixed_stac_item['id']}"
+  fix_file.write(f"curl -k -s -S -H 'Content-Type: application/geo+json' -X PUT --data @{stac_path} '{cat_req_url}'\n")
+  unfix_file.write(f"curl -k -s -S -H 'Content-Type: application/geo+json' -X PUT --data @{stac_path} '{cat_req_url}'\n")
+  #Diff file
+  diff_file.write(f"diff -U 0 --label '{stac_path}' --label '{fix_file_num}.fix' <(jq --sort-keys . '{stac_path}') <(jq --sort-keys . '{fprefix}.{fix_file_num}.fix')\n")
+  #Increment file number
+  fix_file_num+=1
+
 #Error codes returned. Criticals are lower than 100
 # 0   All valid (no error provided)
 # 1   Invalid JSON
@@ -438,6 +465,7 @@ def check_product(stac_path,product_assets_path):
   num_assets=0
   size_assets=0
   errors={}
+  product_needs_fix=False
   for asset_name in stac_item['assets']:
     num_assets=num_assets+1
     asset=stac_item['assets'][asset_name]
@@ -465,17 +493,32 @@ def check_product(stac_path,product_assets_path):
     size_assets=size_assets+asset_size
     #Check asset size
     if 'file:size' not in asset:
-      errors.setdefault(asset_name, []).append(4)
+      if 'fix_missing_size' in args and args.fix_missing_size:
+        asset['file:size']=asset_size
+        product_needs_fix=True
+      else:
+        errors.setdefault(asset_name, []).append(4)
     elif asset['file:size'] != asset_size:
-      print(asset_size)
-      errors.setdefault(asset_name, []).append(5)
-      continue
+      if 'fix_size_mismatch' in args and args.fix_size_mismatch:
+        asset['file:size']=asset_size
+        product_needs_fix=True
+      else:
+        errors.setdefault(asset_name, []).append(5)
+        continue
     #Check asset checksum
     if 'file:checksum' not in asset:
-      errors.setdefault(asset_name, []).append(101)
+      if 'fix_missing_checksum' in args and args.fix_missing_checksum:
+        asset['file:checksum']=calculate_multihash(asset_file)
+        product_needs_fix=True
+      else:
+        errors.setdefault(asset_name, []).append(101)
     elif not verify_multihash(asset_file,asset['file:checksum']):
-      errors.setdefault(asset_name, []).append(6)
-      continue
+      if 'fix_checksum_mismatch' in args and args.fix_checksum_mismatch:
+        asset['file:checksum']=calculate_multihash(asset_file)
+        product_needs_fix=True
+      else:
+        errors.setdefault(asset_name, []).append(6)
+        continue
     #Check asset format type exists
     if 'type' not in asset:
       errors.setdefault(asset_name, []).append(7)
@@ -489,8 +532,13 @@ def check_product(stac_path,product_assets_path):
       elif asset_fmt_check==2:
         errors.setdefault(asset_name, []).append(102)
 
+  #There should be at least one data asset
   if num_data_assets==0:
     errors[0]=[2]
+
+  #Generate product fix
+  if product_needs_fix:
+    fix_product(stac_path,stac_item)
 
   return (num_assets,num_data_assets,size_assets,errors)
 
@@ -558,28 +606,42 @@ def check_collection(coll_name):
   #return result
   return {"numProducts":numProducts,"numAssets":numAssets,"numDataAssets":numDataAssets,"totalSize":totalSize,"errorSummary":{k: v for k,v in enumerate(errorSummary) if v>0},"errorProducts":errorProducts}
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: reg-api-stats [start|stop|status|run]")
-        sys.exit(1)
+#Main
+parser = argparse.ArgumentParser(description="Offline checks on registered collections.")
+subparsers = parser.add_subparsers()
+parser_start = subparsers.add_parser('start', help='Start as deamon. Configuration is in the config file.')
+parser_start.set_defaults(command='start')
+parser_stop = subparsers.add_parser('stop', help='Stop the deamon.')
+parser_stop.set_defaults(command='stop')
+parser_status = subparsers.add_parser('status', help='Check deamon status.')
+parser_status.set_defaults(command='status')
+parser_run = subparsers.add_parser('run', help='Run in standalone mode. Good for testing, debug and fixing operations')
+parser_run.set_defaults(command='run')
+parser_run.add_argument('--fix-script-prefix', type=str, default='metadata', help='Prefix for the generated fix scripts. Defaults to the local folder')
+parser_run.add_argument('--fix-missing-size', action='store_true', help='Fix missing file:size metadata, set it to current file size from disk. USE WITH CAUTION!')
+parser_run.add_argument('--fix-size-mismatch', action='store_true', help='Fix file:size metadata mismatch on disk, override current and set it to file size from disk. USE WITH CAUTION!')
+parser_run.add_argument('--fix-missing-checksum', action='store_true', help='Fix missing file:checksum metadata, set it to current file size from disk. USE WITH CAUTION!')
+parser_run.add_argument('--fix-checksum-mismatch', action='store_true', help='Fix file:checksum metadata mismatch on disk, set it to current file checks from disk. USE WITH CAUTION!')
+parser_run.add_argument('colls',nargs='*', help='Collections to perfom checks. If not set, all will be used')
+args=parser.parse_args()
 
-    command = sys.argv[1].lower()
-
-    if command == "start":
-        start()
-    elif command == "stop":
-        stop()
-    elif command == "status":
-        status()
-    elif command == "run":
-        #Force full run (good for testing and next upgade)
-        LOG_FILE='/dev/stdout'
-        if len(sys.argv) > 2:
-          #Force single run
-          colls=sys.argv[2:]
-          run_job(colls)
-        else:
-          run_job()
-    else:
-        print("Unknown command. Use start, stop, status or run.")
-        sys.exit(1)
+if args.command == "start":
+  start()
+elif args.command == "stop":
+  stop()
+elif args.command == "status":
+  status()
+elif args.command == "run":
+  #Force full run (good for testing and next upgade)
+  LOG_FILE='/dev/stdout'
+  #Force single run
+  run_job(args.colls)
+  #Check if fixes are applied
+  if fix_file is not None:
+    fix_file.close()
+    unfix_file.close()
+    diff_file.close()
+    print(f"There are products to fix.\nRun the 'bash {args.fix_script_prefix}.all.diff' bash script to check what fix will be applied.\nRun the 'bash -x {args.fix_script_prefix}.all.fix' to apply the fix.\nRun the 'bash -x {args.fix_script_prefix}.all.unfix' to revert to the original file.\nNOTE: Generated statistics refer to products after fixing is applied!")
+else:
+  print("Unknown command. Use start, stop, status or run.")
+  sys.exit(1)
