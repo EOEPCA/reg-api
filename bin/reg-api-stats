@@ -248,10 +248,6 @@ def run_job_internal(force_colls=[]):
       for entry in it:
         if entry.is_dir(follow_symlinks=False):
           collist.append(entry.name)
-    collist_file=os.path.join(stats_folder,'collections.list')
-    with open(collist_file,'w') as f:
-      json.dump(collist,f)
-    log(f"Collection list written to {collist_file}")
   log(f"{len(collist)} collections to scan!")
   
   #Scan collection and write stats file
@@ -261,6 +257,14 @@ def run_job_internal(force_colls=[]):
     with open(stats_file, 'w') as f:
       json.dump(stats,f, ensure_ascii=False)
     log(f"Updated stats file {stats_file}")
+
+  #Write stats file (only at the end, when all stats are retreived and only if we do not update
+  #only one specific statistic)
+  if len(force_colls)==0:
+    collist_file=os.path.join(stats_folder,'collections.list')
+    with open(collist_file,'w') as f:
+      json.dump({"lastupdated":datetime.utcnow().isoformat() + "Z","collections":collist},f)
+    log(f"Collection list written to {collist_file}")
   
   log("Stats retreival complete")
 
@@ -304,7 +308,7 @@ def verify_fileformat(filepath,fmt):
   if fmt_beginning=='image/tiff':
     #We recommend geotiff or cogs. Check it is valid geotiff using GDAL
     try:
-      gdalinfo=json.loads(subprocess.check_output(['gdalinfo','-json',filepath]).decode('utf-8'))
+      gdalinfo=json.loads(subprocess.check_output(['gdalinfo','-json',filepath], stderr=subprocess.STDOUT).decode('utf-8'))
       if 'driverLongName' not in gdalinfo or gdalinfo['driverLongName']!='GeoTIFF': return 1
     except Exception:
       return 1
@@ -367,6 +371,9 @@ def get_directory_size(path):
     scan_dir(path)
     return total_size
 
+def get_mime_type(path):
+  return subprocess.check_output(['file','-b','--mime-type',path],stderr=subprocess.STDOUT).decode('utf-8').strip()
+
 fix_file=None
 unfix_file=None
 diff_file=None
@@ -425,11 +432,19 @@ def check_product(stac_path,product_assets_path):
   #Apply fix to datarole if requested
   product_needs_fix=False
   if 'fix_add_datarole' in args and args.fix_add_datarole is not None:
-    if args.fix_add_datarole in stac_item['assets']:
+    if args.fix_add_datarole == '*':
+      for eln in stac_item['assets']:
+        el=stac_item['assets'][eln]
+        if 'roles' not in el:
+          el['roles']=['data']
+        elif 'data' not in el['roles']:
+          el['roles']+=['data']
+      product_needs_fix=True
+    elif args.fix_add_datarole in stac_item['assets']:
       el=stac_item['assets'][args.fix_add_datarole]
       if 'roles' not in el:
         el['roles']=['data']
-      elif 'data' not in asset['roles']:
+      elif 'data' not in el['roles']:
         el['roles']+=['data']
       del el
       product_needs_fix=True
@@ -493,6 +508,9 @@ def check_product(stac_path,product_assets_path):
         continue
     #Check asset format type exists
     if 'type' not in asset:
+      if 'fix_missing_type' in args and args.fix_missing_type:
+        asset['type']=get_mime_type(asset_file)
+        product_needs_fix=True
       errors.setdefault(asset_name, []).append(7)
       continue
     #Check asset format is valid (only for data roles)
@@ -597,7 +615,8 @@ parser_run.add_argument('--fix-missing-size', action='store_true', help='Fix mis
 parser_run.add_argument('--fix-size-mismatch', action='store_true', help='Fix file:size metadata mismatch on disk, override current and set it to file size from disk. USE WITH CAUTION!')
 parser_run.add_argument('--fix-missing-checksum', action='store_true', help='Fix missing file:checksum metadata, set it to current file size from disk. USE WITH CAUTION!')
 parser_run.add_argument('--fix-checksum-mismatch', action='store_true', help='Fix file:checksum metadata mismatch on disk, set it to current file checks from disk. USE WITH CAUTION!')
-parser_run.add_argument('--fix-add-datarole', type=str, default=None, metavar='<assetname>', help='Add data role to asset <assetname>. Useful for fixing missing data role. USE WITH CAUTION!')
+parser_run.add_argument('--fix-add-datarole', type=str, default=None, metavar='<assetname>', help='Add data role to asset <assetname>. Useful for fixing missing data role. Use `*` to add the data tore to all assets. USE WITH CAUTION!')
+parser_run.add_argument('--fix-missing-type', action='store_true', help='Fix missing type metadata, set it to the output of file command on the asset. USE WITH CAUTION!')
 
 parser_run.add_argument('colls',nargs='*', help='Collections to perfom checks. If not set, all will be used')
 args=parser.parse_args()
