@@ -341,6 +341,22 @@ def verify_fileformat(filepath,fmt):
     except Exception as e:
       print(e)
       return 1
+  elif fmt_beginning == 'application/geo+json':
+    #For GeoJSON, try to load it and check the type is valid
+    try:
+      with open(filepath,'r') as f:
+        data=json.load(f)
+      if 'type' not in data: return 1
+      if data['type'] not in ['Point', 'LineString', 'Polygon', 'MultiPoint', 'MultiLineString', 'MultiPolygon', 'GeometryCollection', 'Feature', 'FeatureCollection']: return 1
+      return 0
+    except Exception:
+      return 1
+  elif fmt_beginning ==  'application/vnd.apache.parquet':
+    try:
+      gdalinfo=json.loads(subprocess.check_output(['gdalinfo','-json',filepath], stderr=subprocess.STDOUT).decode('utf-8'))
+      if 'driverShortName' not in gdalinfo or gdalinfo['driverShortName']!='Parquet': return 1
+    except Exception:
+      return 1
   else:
     return 2
 
@@ -408,7 +424,7 @@ def fix_product(stac_path,fixed_stac_item):
 #Error codes returned. Criticals are lower than 100
 # 0   All valid (no error provided)
 # 1   Invalid JSON
-# 2   No assets of type data
+# 2   No assets with valid (data or documentation) roles
 # 100 Asset is a remote asset
 # 3   Assets not found on disk
 # 4   Asset size not found in JSON
@@ -416,7 +432,7 @@ def fix_product(stac_path,fixed_stac_item):
 # 101 Asset checksum not found in JSON
 # 6   Asset checksum mismatch on disk
 # 7   Asset format not found in JSON
-# 8   Asset format mismatch on disk
+# 8   Data is corrupted (asset format validation failed)
 # 102 Asset format is not recommended format (and cannot be validated)
 # 103 Collection is empty (NOTE: this is an error at collection level not product level)
 def check_product(stac_path,product_assets_path):
@@ -448,8 +464,20 @@ def check_product(stac_path,product_assets_path):
         el['roles']+=['data']
       del el
       product_needs_fix=True
+  if 'fix_remove_datarole' in args and args.fix_remove_datarole is not None:
+    if args.fix_remove_datarole == '*':
+      for eln in stac_item['assets']:
+        el=stac_item['assets'][eln]
+        if 'roles' in el and 'data' in el['roles']:
+          el['roles'].remove('data')
+          product_needs_fix=True
+    elif args.fix_remove_datarole in stac_item['assets']:
+      el=stac_item['assets'][args.fix_remove_datarole]
+      if 'roles' in el and 'data' in el['roles']:
+        el['roles'].remove('data')
+        product_needs_fix=True
   #Check assets (record number of type data assets as there should be at least one
-  num_data_assets=0
+  num_validroles_assets=0
   num_assets=0
   size_assets=0
   errors={}
@@ -458,9 +486,12 @@ def check_product(stac_path,product_assets_path):
     asset=stac_item['assets'][asset_name]
     #Check if the asset is of data type
     asset_is_data=False
-    if 'roles' in asset and 'data' in asset['roles']:
-      num_data_assets=num_data_assets+1
-      asset_is_data=True
+    if 'roles' in asset:
+      if 'data' in asset['roles']:
+        num_validroles_assets+=1
+        asset_is_data=True
+      elif 'documentation' in asset['roles']:
+        num_validroles_assets+=1
     #Check if asset is local or not
     if 'href' not in asset or asset['href'][0]!='/':
       errors.setdefault(asset_name, []).append(100)
@@ -493,26 +524,28 @@ def check_product(stac_path,product_assets_path):
         errors.setdefault(asset_name, []).append(5)
         continue
     #Check asset checksum
-    if 'file:checksum' not in asset:
-      if 'fix_missing_checksum' in args and args.fix_missing_checksum:
-        asset['file:checksum']=calculate_multihash(asset_file)
-        product_needs_fix=True
-      else:
-        errors.setdefault(asset_name, []).append(101)
-    elif not verify_multihash(asset_file,asset['file:checksum']):
-      if 'fix_checksum_mismatch' in args and args.fix_checksum_mismatch:
-        asset['file:checksum']=calculate_multihash(asset_file)
-        product_needs_fix=True
-      else:
-        errors.setdefault(asset_name, []).append(6)
-        continue
+    if not ('skip_checksum_checks' in args and args.skip_checksum_checks):
+      if 'file:checksum' not in asset:
+        if 'fix_missing_checksum' in args and args.fix_missing_checksum:
+          asset['file:checksum']=calculate_multihash(asset_file)
+          product_needs_fix=True
+        else:
+          errors.setdefault(asset_name, []).append(101)
+      elif not verify_multihash(asset_file,asset['file:checksum']):
+        if 'fix_checksum_mismatch' in args and args.fix_checksum_mismatch:
+          asset['file:checksum']=calculate_multihash(asset_file)
+          product_needs_fix=True
+        else:
+          errors.setdefault(asset_name, []).append(6)
+          continue
     #Check asset format type exists
     if 'type' not in asset:
       if 'fix_missing_type' in args and args.fix_missing_type:
         asset['type']=get_mime_type(asset_file)
         product_needs_fix=True
-      errors.setdefault(asset_name, []).append(7)
-      continue
+      else:
+        errors.setdefault(asset_name, []).append(7)
+        continue
     #Check asset format is valid (only for data roles)
     if asset_is_data:
       asset_fmt_check=verify_fileformat(asset_file,asset['type'])
@@ -523,14 +556,14 @@ def check_product(stac_path,product_assets_path):
         errors.setdefault(asset_name, []).append(102)
 
   #There should be at least one data asset
-  if num_data_assets==0:
+  if num_validroles_assets==0:
     errors[0]=[2]
 
   #Generate product fix
   if product_needs_fix:
     fix_product(stac_path,stac_item)
 
-  return (num_assets,num_data_assets,size_assets,errors)
+  return (num_assets,num_validroles_assets,size_assets,errors)
 
 #Checks a collection for assets correctness, will store any error found in the errorlog file, will return the total size of the 
 def check_collection(coll_name):
@@ -547,7 +580,7 @@ def check_collection(coll_name):
   totalSize=0
   numProducts=0
   numAssets=0
-  numDataAssets=0
+  numValidRolesAssets=0
   errorProducts={}
   errorSummary=[0]*255
   #For the JSON folders by reg-api, you always have a path which is year/month/day
@@ -582,7 +615,7 @@ def check_collection(coll_name):
                           path5_assets=os.path.join(path4_assets,entry4.name)
                           product_check_results=check_product(path5,path5_assets)
                           numAssets=numAssets+product_check_results[0]
-                          numDataAssets=numDataAssets+product_check_results[1]
+                          numValidRolesAssets=numValidRolesAssets+product_check_results[1]
                           totalSize=totalSize+product_check_results[2]
                           numProducts=numProducts+1
                           if len(product_check_results[3])>0:
@@ -597,7 +630,7 @@ def check_collection(coll_name):
   if numProducts==0:
     errorSummary[103]=-1
   #Return result
-  return {"numProducts":numProducts,"numAssets":numAssets,"numDataAssets":numDataAssets,"totalSize":totalSize,"errorSummary":{k: v for k,v in enumerate(errorSummary) if v!=0},"errorProducts":errorProducts}
+  return {"numProducts":numProducts,"numAssets":numAssets,"numValidRolesAssets":numValidRolesAssets,"totalSize":totalSize,"errorSummary":{k: v for k,v in enumerate(errorSummary) if v!=0},"errorProducts":errorProducts}
 
 #Main
 parser = argparse.ArgumentParser(description="Offline checks on registered collections.")
@@ -610,12 +643,14 @@ parser_status = subparsers.add_parser('status', help='Check deamon status.')
 parser_status.set_defaults(command='status')
 parser_run = subparsers.add_parser('run', help='Run in standalone mode. Good for testing, debug and fixing operations')
 parser_run.set_defaults(command='run')
+parser_run.add_argument('--skip-checksum-checks', action='store_true', help='Skip checksum checks. Useful to speed-up analysis when you have to quickly fix issues.')
 parser_run.add_argument('--fix-script-prefix', type=str, default='metadata', metavar='<prefix>', help='Prefix for the generated fix scripts. Defaults to the local folder')
 parser_run.add_argument('--fix-missing-size', action='store_true', help='Fix missing file:size metadata, set it to current file size from disk. USE WITH CAUTION!')
 parser_run.add_argument('--fix-size-mismatch', action='store_true', help='Fix file:size metadata mismatch on disk, override current and set it to file size from disk. USE WITH CAUTION!')
 parser_run.add_argument('--fix-missing-checksum', action='store_true', help='Fix missing file:checksum metadata, set it to current file size from disk. USE WITH CAUTION!')
 parser_run.add_argument('--fix-checksum-mismatch', action='store_true', help='Fix file:checksum metadata mismatch on disk, set it to current file checks from disk. USE WITH CAUTION!')
 parser_run.add_argument('--fix-add-datarole', type=str, default=None, metavar='<assetname>', help='Add data role to asset <assetname>. Useful for fixing missing data role. Use `*` to add the data tore to all assets. USE WITH CAUTION!')
+parser_run.add_argument('--fix-remove-datarole', type=str, default=None, metavar='<assetname>', help='Remove data role for asset <assetname>. Useful for fixing wrong data role, for example for invalid asset types which should not have the data role. Use `*` to add the data tore to all assets. USE WITH CAUTION!')
 parser_run.add_argument('--fix-missing-type', action='store_true', help='Fix missing type metadata, set it to the output of file command on the asset. USE WITH CAUTION!')
 
 parser_run.add_argument('colls',nargs='*', help='Collections to perfom checks. If not set, all will be used')
