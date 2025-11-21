@@ -85,7 +85,10 @@ del conf
 def log(message: str):
     """Append a timestamped message to the log file."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_FILE, "a") as f:
+    if LOG_FILE=="/dev/stdout":
+      print(f"[{timestamp}] {message}")
+    else:
+      with open(LOG_FILE, "a") as f:
         f.write(f"[{timestamp}] {message}\n")
 
 def daemonize():
