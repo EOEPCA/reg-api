@@ -13,7 +13,7 @@ import sys
 import time
 import signal
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 import hashlib
 import zipfile
 import stat
@@ -77,17 +77,21 @@ def load_conf():
 conf = load_conf()
 PID_FILE=conf['pid']
 LOG_FILE=conf['logfile']
+LOG_FILE_MAXSIZE=int(conf['logmaxsize'])*1024*1024
 CRON_STR=conf['cron']
 CFGPATH=conf['config_path']
+CHECKSUM_FREQUENCY=conf['compute_checksum_every']
 CFGFILE = os.path.join(CFGPATH,"conf.yaml")
 del conf
 
 def log(message: str):
     """Append a timestamped message to the log file."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     if LOG_FILE=="/dev/stdout":
       print(f"[{timestamp}] {message}")
     else:
+      if os.path.getsize(LOG_FILE) > LOG_FILE_MAXSIZE:
+        os.remove(LOG_FILE)
       with open(LOG_FILE, "a") as f:
         f.write(f"[{timestamp}] {message}\n")
 
@@ -142,7 +146,7 @@ def next_cron_datetime(cron_expr: str, start_time = None) -> datetime:
     Supports: minute, hour, day of month, month, day of week.
     """
     if start_time is None:
-        start_time = datetime.utcnow().replace(second=0, microsecond=0)
+        start_time = datetime.now(UTC).replace(second=0, microsecond=0)
     else:
         start_time = start_time.replace(second=0, microsecond=0)
 
@@ -169,7 +173,7 @@ def next_cron_datetime(cron_expr: str, start_time = None) -> datetime:
 def get_next_run_time():
     """Return datetime of next scheduled run."""
 
-    now = datetime.now()
+    now = datetime.now(UTC)
     next_run = next_cron_datetime(CRON_STR, now)
 
     return next_run
@@ -177,13 +181,24 @@ def get_next_run_time():
 def run_daemon():
     """Main loop for daemon."""
     signal.signal(signal.SIGTERM, handle_exit)
-    
+    runs_executed=0
     while True:
-        next_run = get_next_run_time()
-        next_run_interval_s = round((next_run - datetime.now()).total_seconds())
+        try:
+          next_run = get_next_run_time()
+          next_run_interval_s = round((next_run - datetime.now(UTC)).total_seconds())
+        except Exception as e:
+          log(f"Invalid cron string. Exiting. {e}")
+          exit(1)
         log(f"Next run scheduled at {next_run}. In {next_run_interval_s} seconds.")
         time.sleep(next_run_interval_s)
-        run_job()
+        if runs_executed>CHECKSUM_FREQUENCY:
+          check_params.skip_checksum_checks=False
+          run_job()
+          runs_executed=0
+        else:
+          check_params.skip_checksum_checks=True
+          run_job()
+        runs_executed+=1
 
 def handle_exit(signum, frame):
     """Handle SIGTERM for clean shutdown."""
@@ -222,55 +237,66 @@ def status():
     if os.path.exists(PID_FILE):
         with open(PID_FILE, "r") as f:
             pid = f.read().strip()
-        print(f"Daemon is running (PID: {pid})")
+        try:
+          os.kill(int(pid), 0)  # does not kill; just checks
+        except OSError:
+          print(f"Daemon is not running, but PID file exists (PID: {pid} DEFUNKT)")
+        else:
+          print(f"Daemon is running (PID: {pid})")
     else:
         print("Daemon is not running.")
 
 
 def run_job(force_colls=[]):
-    """The main task to be run."""
-    log("Starting stats update...")
-    try:
-        run_job_internal(force_colls)
-    except Exception as e:
-        log(f"ERROR stats updates failed. Error: {e}")
-
-def run_job_internal(force_colls=[]):
-  #Do stats update
-  #Load config file every time, so we get change updates
-  cfg=load_yaml(CFGFILE)
-  stac_folder=os.path.join(cfg['config']['datastore_folder'],cfg['config']['stac_subfolder'])
-  stats_folder=cfg['stats']['stats_folder']
-  del cfg
-
-  if len(force_colls)>0:
-    collist=force_colls
+  """The main task to be run."""
+  if check_params.skip_checksum_checks:
+    log("Starting stats update (skipping checksum checks)...")
   else:
-    collist=[]
-    with os.scandir(stac_folder) as it:
-      for entry in it:
-        if entry.is_dir(follow_symlinks=False):
-          collist.append(entry.name)
-  log(f"{len(collist)} collections to scan!")
-  
-  #Scan collection and write stats file
-  for c in collist:
-    stats_file=os.path.join(stats_folder,c+'.json')
-    stats = check_collection(c)
-    with open(stats_file, 'w') as f:
-      json.dump(stats,f, ensure_ascii=False)
-    log(f"Updated stats file {stats_file}")
+    log("Starting stats update (including checksum checks)...")
+  try:
+    #Do stats update
+    #Load config file every time, so we get change updates
+    cfg=load_yaml(CFGFILE)
+    stac_folder=os.path.join(cfg['config']['datastore_folder'],cfg['config']['stac_subfolder'])
+    stats_folder=cfg['stats']['stats_folder']
+    del cfg
 
-  #Write stats file (only at the end, when all stats are retreived and only if we do not update
-  #only one specific statistic)
-  if len(force_colls)==0:
-    collist_file=os.path.join(stats_folder,'collections.list')
-    with open(collist_file,'w') as f:
-      json.dump({"lastupdated":datetime.utcnow().isoformat() + "Z","collections":collist},f)
-    log(f"Collection list written to {collist_file}")
-  
-  log("Stats retreival complete")
+    if len(force_colls)>0:
+      collist=force_colls
+    else:
+      collist=[]
+      with os.scandir(stac_folder) as it:
+        for entry in it:
+          if entry.is_dir(follow_symlinks=False):
+            collist.append(entry.name)
+    
+    collnum=0
+    colltotal=len(collist)
+    log(f"{colltotal} collections to scan!")
 
+    #Scan collection and write stats file
+    for c in collist:
+      collnum+=1
+      log(f"[{collnum}/{colltotal}] Scanning collection {c}")
+      stats_file=os.path.join(stats_folder,c+'.json')
+      stats = check_collection(c)
+      with open(stats_file, 'w') as f:
+        json.dump(stats,f, ensure_ascii=False)
+      os.chmod(stats_file, 0o644)
+      log(f"Updated stats file {stats_file}")
+
+    #Write stats file (only at the end, when all stats are retreived and only if we do not update
+    #only one specific statistic)
+    if len(force_colls)==0:
+      collist_file=os.path.join(stats_folder,'collections.list')
+      with open(collist_file,'w') as f:
+        json.dump({"lastupdated":datetime.now(UTC).isoformat() + "Z","collections":collist},f)
+      log(f"Collection list written to {collist_file}")
+      os.chmod(collist_file, 0o644)
+
+    log("Stats retreival complete")
+  except Exception as e:
+    log(f"ERROR stats updates failed. Error: {e}")
 
 def verify_multihash(filepath,multihash):
   # Multihash format: <hash code><digest length><digest>
@@ -393,34 +419,48 @@ def get_directory_size(path):
 def get_mime_type(path):
   return subprocess.check_output(['file','-b','--mime-type',path],stderr=subprocess.STDOUT).decode('utf-8').strip()
 
-fix_file=None
-unfix_file=None
-diff_file=None
-fix_file_num=0
+
+#Check global arguments
+class check_params_struct:
+    fix_file=None
+    unfix_file=None
+    diff_file=None
+    fix_file_num=0
+    fix_script_prefix='metadata'
+    fix_add_datarole=None
+    fix_remove_datarole=None
+    fix_missing_size=False
+    fix_size_mismatch=False
+    fix_missing_checksum=False
+    fix_checksum_mismatch=False
+    fix_missing_type=False
+    skip_checksum_checks=False
+
+check_params=check_params_struct()
+
 def fix_product(stac_path,fixed_stac_item):
   #Write a batch file to apply fix and to revert it
-  global fix_file, unfix_file, diff_file, fix_file_num
-  fprefix=args.fix_script_prefix
-  if fix_file is None:
-    fix_file=open(f'{fprefix}.all.fix','w')
-    unfix_file=open(f'{fprefix}.all.unfix','w')
-    diff_file=open(f'{fprefix}.all.diff','w')
-    fix_file.write("#!/bin/bash\n#This script applies patches to the metadata\n")
-    unfix_file.write("#!/bin/bash\n#This script reverts the patches applied to the metadata\n")
-    diff_file.write("#!/bin/bash\n#This script shows the patches to be applied\n")
+  global check_params
+  if check_params.fix_file is None:
+    check_params.fix_file=open(f'{check_params.fix_script_prefix}.all.fix','w')
+    check_params.unfix_file=open(f'{check_params.fix_script_prefix}.all.unfix','w')
+    check_params.diff_file=open(f'{check_params.fix_script_prefix}.all.diff','w')
+    check_params.fix_file.write("#!/bin/bash\n#This script applies patches to the metadata\n")
+    check_params.unfix_file.write("#!/bin/bash\n#This script reverts the patches applied to the metadata\n")
+    check_params.diff_file.write("#!/bin/bash\n#This script shows the patches to be applied\n")
   #Write the new stac file
-  with open(f"{fprefix}.{fix_file_num}.fix",'w') as f:
+  with open(f"{check_params.fix_script_prefix}.{check_params.fix_file_num}.fix",'w') as f:
     json.dump(fixed_stac_item,f)
-  os.system(f"cp '{stac_path}' '{fprefix}.{fix_file_num}.unfix'")
-  fix_file.write(f"cp -f '{fprefix}.{fix_file_num}.fix' '{stac_path}'\n")
-  unfix_file.write(f"cp -f '{fprefix}.{fix_file_num}.unfix' '{stac_path}'\n")
+  os.system(f"cp '{stac_path}' '{check_params.fix_script_prefix}.{check_params.fix_file_num}.unfix'")
+  fix_file.write(f"cp -f '{check_params.fix_script_prefix}.{check_params.fix_file_num}.fix' '{stac_path}'\n")
+  unfix_file.write(f"cp -f '{check_params.fix_script_prefix}.{check_params.fix_file_num}.unfix' '{stac_path}'\n")
   #Push new stac file to the catalogue
   cfg=load_yaml(CFGFILE)['config']
   cat_req_url=f"{cfg['catalogue_address']}/{fixed_stac_item['collection']}/items/{fixed_stac_item['id']}"
   fix_file.write(f"curl -k -s -S -H 'Content-Type: application/geo+json' -X PUT --data @{stac_path} '{cat_req_url}'\n")
   unfix_file.write(f"curl -k -s -S -H 'Content-Type: application/geo+json' -X PUT --data @{stac_path} '{cat_req_url}'\n")
   #Diff file
-  diff_file.write(f"diff -U 0 --label '{stac_path}' --label '{fix_file_num}.fix' <(jq --sort-keys . '{stac_path}') <(jq --sort-keys . '{fprefix}.{fix_file_num}.fix')\n")
+  diff_file.write(f"diff -U 0 --label '{stac_path}' --label '{check_params.fix_file_num}.fix' <(jq --sort-keys . '{stac_path}') <(jq --sort-keys . '{check_params.fix_script_prefix}.{check_params.fix_file_num}.fix')\n")
   #Increment file number
   fix_file_num+=1
 
@@ -439,6 +479,7 @@ def fix_product(stac_path,fixed_stac_item):
 # 102 Asset format is not recommended format (and cannot be validated)
 # 103 Collection is empty (NOTE: this is an error at collection level not product level)
 def check_product(stac_path,product_assets_path):
+  global check_params
   #Open the JSON file. If it is invalid, we have a problem
   try:
     with open(stac_path,'r') as f:
@@ -450,8 +491,8 @@ def check_product(stac_path,product_assets_path):
     return (0,0,0,{0:[2]})
   #Apply fix to datarole if requested
   product_needs_fix=False
-  if 'fix_add_datarole' in args and args.fix_add_datarole is not None:
-    if args.fix_add_datarole == '*':
+  if check_params.fix_add_datarole is not None:
+    if check_params.fix_add_datarole == '*':
       for eln in stac_item['assets']:
         el=stac_item['assets'][eln]
         if 'roles' not in el:
@@ -459,23 +500,23 @@ def check_product(stac_path,product_assets_path):
         elif 'data' not in el['roles']:
           el['roles']+=['data']
       product_needs_fix=True
-    elif args.fix_add_datarole in stac_item['assets']:
-      el=stac_item['assets'][args.fix_add_datarole]
+    elif check_params.fix_add_datarole in stac_item['assets']:
+      el=stac_item['assets'][check_params.fix_add_datarole]
       if 'roles' not in el:
         el['roles']=['data']
       elif 'data' not in el['roles']:
         el['roles']+=['data']
       del el
       product_needs_fix=True
-  if 'fix_remove_datarole' in args and args.fix_remove_datarole is not None:
-    if args.fix_remove_datarole == '*':
+  if check_params.fix_remove_datarole is not None:
+    if check_params.fix_remove_datarole == '*':
       for eln in stac_item['assets']:
         el=stac_item['assets'][eln]
         if 'roles' in el and 'data' in el['roles']:
           el['roles'].remove('data')
           product_needs_fix=True
-    elif args.fix_remove_datarole in stac_item['assets']:
-      el=stac_item['assets'][args.fix_remove_datarole]
+    elif check_params.fix_remove_datarole in stac_item['assets']:
+      el=stac_item['assets'][check_params.fix_remove_datarole]
       if 'roles' in el and 'data' in el['roles']:
         el['roles'].remove('data')
         product_needs_fix=True
@@ -514,28 +555,28 @@ def check_product(stac_path,product_assets_path):
     size_assets=size_assets+asset_size
     #Check asset size
     if 'file:size' not in asset:
-      if 'fix_missing_size' in args and args.fix_missing_size:
+      if check_params.fix_missing_size:
         asset['file:size']=asset_size
         product_needs_fix=True
       else:
         errors.setdefault(asset_name, []).append(4)
     elif asset['file:size'] != asset_size:
-      if 'fix_size_mismatch' in args and args.fix_size_mismatch:
+      if check_params.fix_size_mismatch:
         asset['file:size']=asset_size
         product_needs_fix=True
       else:
         errors.setdefault(asset_name, []).append(5)
         continue
     #Check asset checksum
-    if not ('skip_checksum_checks' in args and args.skip_checksum_checks):
+    if not check_params.skip_checksum_checks:
       if 'file:checksum' not in asset:
-        if 'fix_missing_checksum' in args and args.fix_missing_checksum:
+        if check_params.fix_missing_checksum:
           asset['file:checksum']=calculate_multihash(asset_file)
           product_needs_fix=True
         else:
           errors.setdefault(asset_name, []).append(101)
       elif not verify_multihash(asset_file,asset['file:checksum']):
-        if 'fix_checksum_mismatch' in args and args.fix_checksum_mismatch:
+        if check_params.fix_checksum_mismatch:
           asset['file:checksum']=calculate_multihash(asset_file)
           product_needs_fix=True
         else:
@@ -543,7 +584,7 @@ def check_product(stac_path,product_assets_path):
           continue
     #Check asset format type exists
     if 'type' not in asset:
-      if 'fix_missing_type' in args and args.fix_missing_type:
+      if check_params.fix_missing_type:
         asset['type']=get_mime_type(asset_file)
         product_needs_fix=True
       else:
@@ -570,7 +611,6 @@ def check_product(stac_path,product_assets_path):
 
 #Checks a collection for assets correctness, will store any error found in the errorlog file, will return the total size of the 
 def check_collection(coll_name):
-  log(f"Scanning collection {coll_name}")
   #Load config file every time, so we get change updates
   cfg=load_yaml(CFGFILE)['config']
   asset_folder=os.path.join(cfg['datastore_folder'],cfg['assets_subfolder'])
@@ -678,13 +718,23 @@ elif args.command == "status":
 elif args.command == "run":
   #Force full run (good for testing and next upgade)
   LOG_FILE='/dev/stdout'
+  #Get command line parameters
+  check_params.fix_script_prefix=args.fix_script_prefix
+  check_params.fix_add_datarole=args.fix_add_datarole
+  check_params.fix_remove_datarole=args.fix_remove_datarole
+  check_params.fix_missing_size=args.fix_missing_size
+  check_params.fix_size_mismatch=args.fix_size_mismatch
+  check_params.fix_missing_checksum=args.fix_missing_checksum
+  check_params.fix_checksum_mismatch=args.fix_checksum_mismatch
+  check_params.fix_missing_type=args.fix_missing_type
+  check_params.skip_checksum_checks=args.skip_checksum_checks
   #Force single run
   run_job(args.colls)
   #Check if fixes are applied
-  if fix_file is not None:
-    fix_file.close()
-    unfix_file.close()
-    diff_file.close()
+  if check_params.fix_file is not None:
+    check_params.fix_file.close()
+    check_params.unfix_file.close()
+    check_params.diff_file.close()
     print(f"There are products to fix.\nRun the 'bash {args.fix_script_prefix}.all.diff' bash script to check what fix will be applied.\nRun the 'bash -x {args.fix_script_prefix}.all.fix' to apply the fix.\nRun the 'bash -x {args.fix_script_prefix}.all.unfix' to revert to the original file.\nNOTE: Generated statistics refer to products after fixing is applied!")
 else:
   print("Unknown command. Use start, stop, status or run.")

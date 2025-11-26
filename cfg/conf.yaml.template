@@ -28,8 +28,12 @@ stats:
   pid: ../log/reg-api-stats.pid
   #This is the LOG File for the stats check daemon
   logfile: ../log/reg-api-stats.log
+  #Delete log after it reaches logmaxsize megabytes
+  logmaxsize: 10
   #Run times in cron syntax
-  cron: '*/15 * * * *'
+  cron: */30 * * * *
   #Where to save the collection statistics
   stats_folder: ../stats/
-
+  #Checksum compute frequency. To avoid stressing the file system, checksums are
+  #computed once every X runs)
+  compute_checksum_every: 336
