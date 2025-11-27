@@ -80,7 +80,7 @@ LOG_FILE=conf['logfile']
 LOG_FILE_MAXSIZE=int(conf['logmaxsize'])*1024*1024
 CRON_STR=conf['cron']
 CFGPATH=conf['config_path']
-CHECKSUM_FREQUENCY=conf['compute_checksum_every']
+CHECKSUM_FREQUENCY=int(conf['compute_checksum_every'])
 CFGFILE = os.path.join(CFGPATH,"conf.yaml")
 del conf
 
@@ -290,7 +290,7 @@ def run_job(force_colls=[]):
     if len(force_colls)==0:
       collist_file=os.path.join(stats_folder,'collections.list')
       with open(collist_file,'w') as f:
-        json.dump({"lastupdated":datetime.now(UTC).isoformat() + "Z","collections":collist},f)
+        json.dump({"lastupdated":datetime.now(UTC).isoformat(),"collections":collist},f)
       log(f"Collection list written to {collist_file}")
       os.chmod(collist_file, 0o644)
 
