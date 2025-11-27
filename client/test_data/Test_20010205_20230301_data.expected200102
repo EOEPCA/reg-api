@@ -3,9 +3,9 @@
     "type": "Feature",
     "stac_version": "1.0.0",
     "stac_extensions": [
-      "https://stac-extensions.github.io/storage/v1.0.0/schema.json"
+      "https://stac-extensions.github.io/file/v2.1.0/schema.json"
     ],
-    "id": "GeogToWGS84GeoKey5",
+    "id": "Test_20010205_20230301_data",
     "properties": {
       "datetime": "2001-02-01T00:00:00Z",
       "start_datetime": "2001-02-01T00:00:00Z",
@@ -13,7 +13,7 @@
     },
     "assets": {
       "PRODUCT": {
-        "href": "GeogToWGS84GeoKey5.tif",
+        "href": "Test_20010205_20230301_data.tif",
         "title": "Product",
         "roles": [
           "data"
