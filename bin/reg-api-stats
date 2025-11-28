@@ -452,17 +452,17 @@ def fix_product(stac_path,fixed_stac_item):
   with open(f"{check_params.fix_script_prefix}.{check_params.fix_file_num}.fix",'w') as f:
     json.dump(fixed_stac_item,f)
   os.system(f"cp '{stac_path}' '{check_params.fix_script_prefix}.{check_params.fix_file_num}.unfix'")
-  fix_file.write(f"cp -f '{check_params.fix_script_prefix}.{check_params.fix_file_num}.fix' '{stac_path}'\n")
-  unfix_file.write(f"cp -f '{check_params.fix_script_prefix}.{check_params.fix_file_num}.unfix' '{stac_path}'\n")
+  check_params.fix_file.write(f"cp -f '{check_params.fix_script_prefix}.{check_params.fix_file_num}.fix' '{stac_path}'\n")
+  check_params.unfix_file.write(f"cp -f '{check_params.fix_script_prefix}.{check_params.fix_file_num}.unfix' '{stac_path}'\n")
   #Push new stac file to the catalogue
   cfg=load_yaml(CFGFILE)['config']
   cat_req_url=f"{cfg['catalogue_address']}/{fixed_stac_item['collection']}/items/{fixed_stac_item['id']}"
-  fix_file.write(f"curl -k -s -S -H 'Content-Type: application/geo+json' -X PUT --data @{stac_path} '{cat_req_url}'\n")
-  unfix_file.write(f"curl -k -s -S -H 'Content-Type: application/geo+json' -X PUT --data @{stac_path} '{cat_req_url}'\n")
+  check_params.fix_file.write(f"curl -k -s -S -H 'Content-Type: application/geo+json' -X PUT --data @{stac_path} '{cat_req_url}'\n")
+  check_params.unfix_file.write(f"curl -k -s -S -H 'Content-Type: application/geo+json' -X PUT --data @{stac_path} '{cat_req_url}'\n")
   #Diff file
-  diff_file.write(f"diff -U 0 --label '{stac_path}' --label '{check_params.fix_file_num}.fix' <(jq --sort-keys . '{stac_path}') <(jq --sort-keys . '{check_params.fix_script_prefix}.{check_params.fix_file_num}.fix')\n")
+  check_params.diff_file.write(f"diff -U 0 --label '{stac_path}' --label '{check_params.fix_file_num}.fix' <(jq --sort-keys . '{stac_path}') <(jq --sort-keys . '{check_params.fix_script_prefix}.{check_params.fix_file_num}.fix')\n")
   #Increment file number
-  fix_file_num+=1
+  check_params.fix_file_num+=1
 
 #Error codes returned. Criticals are lower than 100
 # 0   All valid (no error provided)
