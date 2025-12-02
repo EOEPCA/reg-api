@@ -447,8 +447,6 @@ async def add_item_to_collection(assets_source: str, assets_dest: str, stac_dest
       #Move file
       os.makedirs(os.path.dirname(asset_dst), exist_ok=True)
       os.rename(asset_src,asset_dst)
-      #Cleanup XATTR metadata (if any)
-      if os.path.exists(asset_src+'.xattr'): os.remove(asset_src+'.xattr')
     except Exception as e:
       response_status='Exception'
       response_text=str(e)
