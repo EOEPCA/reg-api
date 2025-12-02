@@ -260,6 +260,32 @@ def ingest_stac(stac_item,collection):
 
   return ingested_stac_item
 
+def get_directory_size(path):
+    """
+    Fast recursive directory size calculation using os.scandir().
+    Returns size in bytes.
+    """
+    total_size = 0
+
+    def scan_dir(p):
+        nonlocal total_size
+        try:
+            with os.scandir(p) as it:
+                for entry in it:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            total_size += entry.stat(follow_symlinks=False).st_size
+                        elif entry.is_dir(follow_symlinks=False):
+                            scan_dir(entry.path)
+                    except OSError:
+                        # Skip files/directories we can't access
+                        pass
+        except OSError:
+            # Skip directories we can't access
+            pass
+
+    scan_dir(path)
+    return total_size
 def product_filename(src):
   #Very basic filename extraction, to be extended
   return os.path.basename(src)
@@ -602,10 +628,13 @@ def publish_stac(pd):
       return  [{"id": stac_item['id'], "failure_reason": f"Asset {assetid} download failed!"}]
     
     #Check asset size and checksum
-    asset_localsize=os.path.getsize(asset_localpath)
+    if os.path.isdir(asset_localpath):
+      asset_localsize=get_directory_size(asset_localpath)
+    else:
+      asset_localsize=os.path.getsize(asset_localpath)
     if 'file:size' in stacassets[assetid]:
       if stacassets[assetid]['file:size'] != asset_localsize:
-        logging.error(f"STAC Item {pd} ingestion failed. Downloaded asset {assetid} file size does not match STAC metadata!")
+        logging.error(f"STAC Item {pd} ingestion failed. Downloaded asset {assetid} file or directory size does not match STAC metadata!")
         return  [{"id": stac_item['id'], "failure_reason": f"Asset {assetid} download failed! File size does not match STAC metadata"}]
     else:
       stacassets[assetid]['file:size']=asset_localsize
