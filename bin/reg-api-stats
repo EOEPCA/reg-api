@@ -464,10 +464,31 @@ def fix_product(stac_path,fixed_stac_item):
   #Increment file number
   check_params.fix_file_num+=1
 
-#Error codes returned. Criticals are lower than 100
+### Error codes returned. Criticals are lower than 100
+### Error codes returned. Criticals are lower than 100
+## Collection (STAC Collection) errors:
 # 0   All valid (no error provided)
-# 1   Invalid JSON
+# 31  Invalid Collection JSON
+# 32  Missing required Collection 'title'
+# 33  Missing required Collection 'description'
+# 34  Missing or invalid Collection 'thumbnail'
+# 35  Missing or invalid Collection 'extent'
+# 36  Missing required Collection 'license'
+# 37  Missing required Collection 'processing:datetime'
+# 38  Missing required Collection 'osc:project'
+# 39  Missing required Collection 'osc:project_description'
+# 40  Missing required Collection 'osc:project_website'
+# 41  Missing required Collection 'osc:initiative'
+# 42  Missing required Collection 'osc:contract-number'
+# 43  Missing required Collection 'themes'
+# 44  Missing required Collection 'osc:variables'
+# 45  Missing required Collection 'cf:parameter'
+# 46  Missing required Collection 'osc:missions'
+# 103 Collection is empty
+## Product (STAC Item) errors:
+# 1   Invalid STAC Item JSON
 # 2   No assets with valid (data or documentation) roles
+## Asset (STAC Item Assets) errors:
 # 100 Asset is a remote asset
 # 3   Assets not found on disk
 # 4   Asset size not found in JSON
@@ -477,18 +498,22 @@ def fix_product(stac_path,fixed_stac_item):
 # 7   Asset format not found in JSON
 # 8   Data is corrupted (asset format validation failed)
 # 102 Asset format is not recommended format (and cannot be validated)
-# 103 Collection is empty (NOTE: this is an error at collection level not product level)
 def check_product(stac_path,product_assets_path):
   global check_params
+  #Get product last modification time as update time
+  try:
+    product_updatetime=os.path.getmtime(stac_path)
+  except Exception as e:
+    return (0,0,0,0,{0:[1]})
   #Open the JSON file. If it is invalid, we have a problem
   try:
     with open(stac_path,'r') as f:
       stac_item = json.load(f)
   except Exception as e:
-    return (0,0,0,{0:[1]})
+    return (product_updatetime,0,0,0,{0:[1]})
   #Check if there are no assets
   if 'assets' not in stac_item:
-    return (0,0,0,{0:[2]})
+    return (product_updatetime,0,0,0,{0:[2]})
   #Apply fix to datarole if requested
   product_needs_fix=False
   if check_params.fix_add_datarole is not None:
@@ -607,7 +632,45 @@ def check_product(stac_path,product_assets_path):
   if product_needs_fix:
     fix_product(stac_path,stac_item)
 
-  return (num_assets,num_validroles_assets,size_assets,errors)
+  return (product_updatetime,num_assets,num_validroles_assets,size_assets,errors)
+
+def check_collection_metadata(stac_path):
+  #List of error codes and how much elements they affect (-1 if they affect the entire collection)
+  errorSummary=[0]*255
+  #Open the JSON file. If it is invalid, we have a problem
+  try:
+    with open(stac_path,'r') as f:
+      stac_item = json.load(f)
+  except Exception as e:
+    errorSummary[31]=-1
+    return (errorSummary,"")
+  #Check required base elements (with their errors)
+  elToCheck={'title':32,'description':33,'license':36,'processing:datetime':37,'osc:project':38,'osc:project_description':39,'osc:project_website':40,'osc:contract-number':42,'themes':43,'osc:variables':44,'cf:parameter':45,'osc:missions':46}
+  for meta in elToCheck:
+    if meta not in stac_item:
+      errorSummary[elToCheck[meta]]=-1
+  #Check special elements (initiative)
+  if 'osc:initiative' in stac_item:
+    oscInitiative=stac_item['osc:initiative']
+  else:
+    oscInitiative=""
+    errorSummary[41]=-1
+  #Check special elements (thumbnail)
+  thumbnailIsPresent=False
+  if 'assets' in stac_item:
+    for assName in stac_item['assets']:
+      ass=stac_item['assets'][assName]
+      if 'roles' in ass and 'thumbnail' in ass['roles']:
+        thumbnailIsPresent=True
+        break
+  if thumbnailIsPresent==False:
+    errorSummary[34]=-1
+  #Check special elements (extent)
+  if 'extent' not in stac_item or 'spatial' not in stac_item['extent'] or 'temporal' not in stac_item['extent']:
+    errorSummary[35]=-1
+  
+  #Return results
+  return (errorSummary,oscInitiative)
 
 #Checks a collection for assets correctness, will store any error found in the errorlog file, will return the total size of the 
 def check_collection(coll_name):
@@ -619,13 +682,15 @@ def check_collection(coll_name):
   del cfg
   #Get the stac folder path for the collection
   path=os.path.join(stac_folder,coll_name)
+  #Check collection metadata. Return the list of errors and how much elements they affect
+  (errorSummary,collInitiative)=check_collection_metadata(path+'.json')
   #Total size and number of products to be returned
   totalSize=0
   numProducts=0
   numAssets=0
   numValidRolesAssets=0
+  lastUpdated=0
   errorProducts={}
-  errorSummary=[0]*255
   #For the JSON folders by reg-api, you always have a path which is year/month/day
   with os.scandir(path) as it:
     #First level, year, no file should be here
@@ -657,14 +722,15 @@ def check_collection(coll_name):
                           path5=os.path.join(path4,entry4.name)
                           path5_assets=os.path.join(path4_assets,entry4.name)
                           product_check_results=check_product(path5,path5_assets)
-                          numAssets=numAssets+product_check_results[0]
-                          numValidRolesAssets=numValidRolesAssets+product_check_results[1]
-                          totalSize=totalSize+product_check_results[2]
+                          if product_check_results[0]>lastUpdated: lastUpdated=product_check_results[0]
+                          numAssets=numAssets+product_check_results[1]
+                          numValidRolesAssets=numValidRolesAssets+product_check_results[2]
+                          totalSize=totalSize+product_check_results[3]
                           numProducts=numProducts+1
-                          if len(product_check_results[3])>0:
-                            errorProducts[entry4.name]=product_check_results[3]
-                          for err_asset in product_check_results[3]:
-                            err_codes = product_check_results[3][err_asset]
+                          if len(product_check_results[4])>0:
+                            errorProducts[entry4.name]=product_check_results[4]
+                          for err_asset in product_check_results[4]:
+                            err_codes = product_check_results[4][err_asset]
                             for ecode in err_codes:
                               errorSummary[ecode]+=1
                         elif entry4.is_dir(follow_symlinks=False):
@@ -672,8 +738,10 @@ def check_collection(coll_name):
   #Flag collection-level issue of empty collection as a warning
   if numProducts==0:
     errorSummary[103]=-1
+  #Convert last udpated date to string
+  lastUpdatedStr = datetime.fromtimestamp(lastUpdated).isoformat() if lastUpdated>0 else "never"
   #Return result
-  return {"numProducts":numProducts,"numAssets":numAssets,"numValidRolesAssets":numValidRolesAssets,"totalSize":totalSize,"errorSummary":{k: v for k,v in enumerate(errorSummary) if v!=0},"errorProducts":errorProducts}
+  return {"lastUpdated":lastUpdatedStr,"collInitiative":collInitiative,"numProducts":numProducts,"numAssets":numAssets,"numValidRolesAssets":numValidRolesAssets,"totalSize":totalSize,"errorSummary":{k: v for k,v in enumerate(errorSummary) if v!=0},"errorProducts":errorProducts}
 
 #Main
 parser = argparse.ArgumentParser(description="Offline checks on registered collections.")
