@@ -380,10 +380,16 @@ def verify_fileformat(filepath,fmt):
       return 0
     except Exception:
       return 1
-  elif fmt_beginning ==  'application/vnd.apache.parquet':
+  elif fmt_beginning ==  'application/vnd.apache.parquet' or fmt_beginning ==  'application/x-parquet':
     try:
       gdalinfo=json.loads(subprocess.check_output(['gdalinfo','-json',filepath], stderr=subprocess.STDOUT).decode('utf-8'))
       if 'driverShortName' not in gdalinfo or gdalinfo['driverShortName']!='Parquet': return 1
+    except Exception:
+      return 1
+  elif fmt_beginning ==  'application/vnd.flatgeobuf':
+    try:
+      gdalinfo=json.loads(subprocess.check_output(['gdalinfo','-json',filepath], stderr=subprocess.STDOUT).decode('utf-8'))
+      if 'driverShortName' not in gdalinfo or gdalinfo['driverShortName']!='FlatGeobuf': return 1
     except Exception:
       return 1
   else:
