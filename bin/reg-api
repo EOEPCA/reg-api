@@ -293,10 +293,10 @@ elif 'coll_action' in args_dict:
     log.info(f"Thumbnail image written in {thumbnail_asset_localfile_path}")
     # Update the STAC Item on disk
     coll_json["assets"]["thumbnail"]["href"]=os.path.join(datastore_url,f"logo.{img_type}")
-    print(json.dumps(coll_json))
-    with open(collection_json, 'w') as f:
-      json.dump(coll_json,f)
-    log.info(f"Collection updated on disk: {coll_json}")
+    coll_data=json.dumps(coll_json).encode('utf-8')
+    with open(collection_json, 'wb') as f:
+      f.write(coll_data)
+    log.info(f"Collection updated on disk: {collection_json}")
 
   #Construct catalogue request
   if args.coll_action == 'add':
