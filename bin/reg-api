@@ -215,6 +215,88 @@ elif 'coll_action' in args_dict:
     log.error(f"{collection_json} id is {coll_json['id']}, but {args.coll_id} is expected!")
     exit(1)
 
+  #Fix the collection thumbnail
+  datastore_url=conf['datastore_external_url'].replace('{coll_id}',args.coll_id)
+  if "assets" in coll_json and "thumbnail" in coll_json["assets"] and "href" in coll_json["assets"]["thumbnail"] and not coll_json["assets"]["thumbnail"]["href"].startswith(datastore_url):
+    thumbnail_href=coll_json["assets"]["thumbnail"]["href"]
+    thumbnail_asset_localfile=os.path.join(conf['datastore_folder'],os.path.join(conf['assets_subfolder'],args.coll_id))
+    #Get the image
+    import urllib.parse
+    import mimetypes
+    decoded=b''
+    if thumbnail_href.startswith('data:'):
+      log.info("Thumbnail data: image detected. Saving it in the asset store...")
+      #Convert data to binary
+      import base64
+      try:
+        header, data = thumbnail_href[5:].split(",", 1)
+      except ValueError:
+        log.error("Malformed data URL: missing comma separator")
+        exit(1)
+
+      if "base64" in header.lower().split(";") if header else []:
+        try:
+          decoded = base64.b64decode(data, validate=True)
+        except Exception as e:
+          log.error("Invalid data url base64 data")
+          exit(1)
+      else:
+        try:
+          decoded = urllib.parse.unquote_to_bytes(data)
+        except Exception as e:
+          log.error("Invalid percent-encoded data")
+          exit(1)
+
+    elif thumbnail_href.startswith('https://') or thumbnail_href.startswith('http://'):
+      log.info("Thumbnail remote link detected. Saving it to the asset store...")
+      try:
+        with urlopen(thumbnail_href) as response:
+          #Download limited to 5MB
+          decoded = response.read(5*1025*1024)
+      except urllib.error.HTTPError as e:
+        log.error(f"HTTP error {e.code}: {e.reason}")
+        exit(1)
+      except urllib.error.URLError as e:
+        log.error(f"URL error: {e.reason}")
+        exit(1)
+      except Exception as e:
+        log.error(f"Unexpected error: {e}")
+        exit(1)
+    else:
+      log.error("Thumbnail points to unrecognized entry. Check the STAC Assets->Thumbnail->href value! Only HTTP/HTTPs urls or data: URLs are valid")
+      exit(1)
+
+    # Validate the decoded data is actually an image
+    if len(decoded)>=5*1025*1024-1:
+      log.error("Thumbnail is bigger than 5MB. A maximum of 5MB is supported!")
+      exit(1)
+    image_headers = {
+        b'\xFF\xD8\xFF': 'jpeg',
+        b'\x89PNG\r\n\x1a\n': 'png',
+        b'GIF87a': 'gif',
+        b'GIF89a': 'gif',
+        b'BM': 'bmp',
+        b'II*\x00': 'tiff',
+        b'MM\x00*': 'tiff',
+    }
+    img_type=None
+    for sig, fmt in image_headers.items():
+      if decoded.startswith(sig):
+         img_type=fmt
+    if img_type is None:
+      log.error("Decoded data is not recognized as an image")
+      exit(1)
+    # Determine file extension
+    thumbnail_asset_localfile_path=os.path.join(thumbnail_asset_localfile,f"logo.{img_type}")
+    with open(thumbnail_asset_localfile_path,'wb') as f:
+      f.write(decoded)
+    log.info(f"Thumbnail image written in {thumbnail_asset_localfile_path}")
+    # Update the STAC Item on disk
+    coll_json["assets"]["thumbnail"]["href"]=os.path.join(datastore_url,f"logo.{img_type}")
+    print(json.dumps(coll_json))
+    with open(collection_json, 'w') as f:
+      json.dump(coll_json,f)
+    log.info(f"Collection updated on disk: {coll_json}")
 
   #Construct catalogue request
   if args.coll_action == 'add':
