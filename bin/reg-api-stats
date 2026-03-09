@@ -666,7 +666,7 @@ def check_collection_metadata(stac_path):
   if 'assets' in stac_item:
     for assName in stac_item['assets']:
       ass=stac_item['assets'][assName]
-      if 'roles' in ass and 'thumbnail' in ass['roles']:
+      if 'roles' in ass and 'thumbnail' in ass['roles'] and 'href' in ass and ass['href'].startswith('/'):
         thumbnailIsPresent=True
         break
   if thumbnailIsPresent==False:
