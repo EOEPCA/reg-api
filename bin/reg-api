@@ -291,6 +291,8 @@ elif 'coll_action' in args_dict:
           exit(1)
         # Determine file extension
         thumbnail_asset_localfile_path=os.path.join(thumbnail_asset_localfile,f"logo.{img_type}")
+        # Ensure the destination directory exists
+        os.makedirs(thumbnail_asset_localfile, exist_ok=True)
         with open(thumbnail_asset_localfile_path,'wb') as f:
           f.write(decoded)
         log.info(f"Thumbnail image written in {thumbnail_asset_localfile_path}")
