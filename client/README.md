@@ -75,5 +75,4 @@ In case a STAC Item is provided in input, its assets will be downloaded and uplo
 
 The input product, whatever STAC Items, STAC Catalogues, STAC Collections or STAC Assets can be provided with a local link, HTTP(s) or S3. 
 
-More details about the tool usage is provided in the help, available via the --help switch.
-
+More info about tool configuration is provided in the live help, available via the --help switch. For detailed installation instructions, examples, dry-run checks, and troubleshooting, see the [Registration API Client User Guide](./USER_GUIDE.md)
