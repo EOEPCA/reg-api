@@ -28,9 +28,9 @@ parser.add_argument('--item-asset-zipping-disable', action='store_true', help='D
 parser.add_argument('--item-asset-checksum-disable', action='store_true', help='Disable ingested asset SHA2-256 checksums. If not set, the client will generate a checksum for the assets to be ingested, check it againist the STAC item one if provided or add it to the STAC item if not.')
 parser.add_argument('--assets-rio-stac', action='store_true', help='If in single asset mode, use rio-stac to extract metadata. IMPORTANT: Data needs to be in a format supported by rio-stac (e.g. Cloud Optmized GeoTIFF). NOTE: You need rio-stac to be installed following documentation on https://developmentseed.org/rio-stac/.')
 
-parser.add_argument('--rapi-endpoint', type=str, default='https://eoresults.esa.int/reg-api/', help='Registration API Endpoint [RAPI_REGAPI_ENDPOINT]. Defaults to: https://eoresults.esa.int/reg-api/')
+parser.add_argument('--rapi-endpoint', type=str, default='https://eoresults.esa.int/reg-api/', help='Registration API Endpoint [RAPI_ENDPOINT]. Defaults to: https://eoresults.esa.int/reg-api/')
 parser.add_argument('--rapi-s3-endpoint', type=str, default='http://eoresults.esa.int', help='S3 Stagein Endpoint [RAPI_S3_ENDPOINT]. Default is eoresults.esa.int')
-parser.add_argument('--rapi-s3-region', type=str, default='us-east-1', help='S3 Stagein Endpoint Region [RAPI_S3_ENDPOINT_SSL]. Default is "us-east-1"')
+parser.add_argument('--rapi-s3-region', type=str, default='us-east-1', help='S3 Stagein Endpoint Region [RAPI_S3_REGION]. Default is "us-east-1"')
 
 parser.add_argument('--assets-aws-access-key-id', type=str, help='For download of STAC Assets, use the given S3 access key ID')
 parser.add_argument('--assets-aws-secret-access-key', type=str, help='For download of STAC Assets, use the given S3 access key secret')
