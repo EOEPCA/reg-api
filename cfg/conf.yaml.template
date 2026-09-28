@@ -37,3 +37,20 @@ stats:
   #Checksum compute frequency. To avoid stressing the file system, checksums are
   #computed once every X runs)
   compute_checksum_every: 336
+  #If not null, access statistics are enabled and extracted from the frontend access logs
+  access_logs_dir: /var/log/nginx
+  #Pattern of the logs file (gzipped files are supported)
+  access_logs_pattern: access_stats.log*
+  #GEOIP database for resolving country download statistics
+  geoip_database: /usr/share/GeoIP/GeoIP.dat
+  #Access logs must contain the following elements:
+  #  $remote_addr [$time_iso8601] "$request" $status $body_bytes_sent
+  #These are extracted via the following regex. Change this only if you know what you are
+  #doing.
+  compute_access_stats: '^(\S+) \[([^\]]+)\] "([^"]*)" (\d+) (\d+)$'
+  #Extract access statistics from only the downloads calls
+  access_stats_filter: '^/d/([^/]+)/'
+  #Event widndows for access statistics to be computed (in seconds)
+  access_event_window: 1800
+  #Number of days for aggregated access statistics
+  access_history_days: 90

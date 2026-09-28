@@ -97,7 +97,7 @@ reg-api includes a simple client application which can be used to ingest data. M
 
 ## Statistics
 
-reg-api includes a statistic application which will generate statistics for the ingested data (size, consistency errors, format errors, etc...). Configuration of teh application is in the `cfg/conf.yaml` file and the appliction can be used as a daemon via `bin/reg-api-stats [start/stop/status]` or one-off via `bin/reg-api-stats run`. The one-off mode supports also fixing of common issues with the data metadata. For more information look at `bin/reg-api-stats --help` and `bin/reg-api-stats run --help`
+reg-api includes a statistic application which will generate statistics for the ingested data (size, consistency errors, format errors, etc...) and download statistics (extracted from nginx or apache frontend logs). Configuration of the statistics is in the `cfg/conf.yaml` file and the statistics extraction application can be used as a daemon via `bin/reg-api-stats [start/stop/status]` or one-off via `bin/reg-api-stats run`. The one-off mode supports also fixing of common issues with the data metadata. For more information look at `bin/reg-api-stats --help` and `bin/reg-api-stats run --help`
 
 ## Development
 

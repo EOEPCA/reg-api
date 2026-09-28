@@ -13,12 +13,23 @@ import sys
 import time
 import signal
 import json
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, timezone, UTC
 import hashlib
 import zipfile
+import gzip
 import stat
 import argparse
 import subprocess
+import re
+from collections import defaultdict
+from io import TextIOWrapper
+from typing import Optional
+from pathlib import Path
+try:
+  import GeoIP as _geoip_mod
+  _GEOIP=True
+except ImportError:
+  _GEOIP=False
 
 #Set current folder to the current script path
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -52,7 +63,7 @@ def read_simple_yaml(path):
             # Key-value line inside a group
             if current_group and ':' in line:
                 key, value = line.split(':', 1)
-                data[current_group][key.strip()] = value.strip()
+                data[current_group][key.strip()] = value.strip(' \n\r\'')
                 continue
 
             # If badly formatted, you could raise an error
@@ -81,6 +92,13 @@ LOG_FILE_MAXSIZE=int(conf['logmaxsize'])*1024*1024
 CRON_STR=conf['cron']
 CFGPATH=conf['config_path']
 CHECKSUM_FREQUENCY=int(conf['compute_checksum_every'])
+ACCESS_LOG_DIR=conf['access_logs_dir']
+ACCESS_LOG_PATTERN=conf['access_logs_pattern']
+GEOIP_DB=conf['geoip_database']
+ACCESS_EVENT_WINDOW_SEC=int(conf['access_event_window'])
+ACCESS_HISTORY_DAYS=int(conf['access_history_days'])
+ACCESS_LOG_RE=re.compile(conf['compute_access_stats'])
+ACCESS_LOG_FI=re.compile(conf['access_stats_filter'])
 CFGFILE = os.path.join(CFGPATH,"conf.yaml")
 del conf
 
@@ -246,13 +264,27 @@ def status():
     else:
         print("Daemon is not running.")
 
-
 def run_job(force_colls=[]):
   """The main task to be run."""
+  #Do access stats update
+  try:
+    #Do stats update
+    #Load config file every time, so we get change updates
+    cfg=load_yaml(CFGFILE)
+    stats_folder=cfg['stats']['stats_folder']
+    del cfg
+    extract_access_stats(stats_folder)
+    log("Access stats refresh completed!")
+  except Exception as e:
+    log(f"ERROR access stats updates failed. Error: {e}")
+
+  if check_params.skip_collection_stats:
+    log("Skipping collection stats update...")
+    return
   if check_params.skip_checksum_checks:
-    log("Starting stats update (skipping checksum checks)...")
+    log("Starting collection stats update (skipping checksum checks)...")
   else:
-    log("Starting stats update (including checksum checks)...")
+    log("Starting collection stats update (including checksum checks)...")
   try:
     #Do stats update
     #Load config file every time, so we get change updates
@@ -297,6 +329,310 @@ def run_job(force_colls=[]):
     log("Stats retreival complete")
   except Exception as e:
     log(f"ERROR stats updates failed. Error: {e}")
+
+
+### Access statistics routines
+###
+
+def open_log(path: Path) -> TextIOWrapper:
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", errors="replace")
+    return path.open("rt", errors="replace")
+
+
+def parse_ts(raw: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(raw).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def collection_initiative(stats_folder: str, coll_id: str) -> str:
+    try:
+        data = json.loads((Path(stats_folder) / f"{coll_id}.json").read_text())
+        return data.get("collInitiative", "")
+    except Exception:
+        return ""
+
+
+def lookup_country(ip: str, reader, cache: dict) -> str:
+    if ip not in cache:
+        try:
+            cache[ip] = reader.country_code_by_addr(ip) or "Unknown"
+        except Exception:
+            cache[ip] = "Unknown"
+    return cache[ip]
+
+
+def log_sort_key(path: Path) -> int:
+    """Sort rotated logs oldest-first so COG dedup sees events in order"""
+    # matches numeric rotation suffix, e.g. access_stats.log.3
+    match = re.search(r"\.(\d+)", path.name)
+    # .1 -> -1, plain log -> 1
+    return -int(match.group(1)) if match else 1
+
+
+def load_state(existing: dict) -> tuple:
+    """Unpack accumulated totals, countries and collections from the existing JSON output"""
+    last_processed = existing.get("last_processed_date")
+    acc = {
+        "bytes": existing.get("totals", {}).get("bytes_transferred", 0),
+        "events": existing.get("totals", {}).get("access_events", 0),
+        "ips": existing.get("totals", {}).get("unique_ips", 0),
+        "stac": existing.get("totals", {}).get("stac_queries", 0),
+        "pubs": existing.get("totals", {}).get("publications", 0),
+    }
+    acc_countries = {}
+    for country, val in (existing.get("countries") or {}).items():
+        if isinstance(val, dict):
+            acc_countries[country] = {
+                "events": val.get("events", 0),
+                "bytes": val.get("bytes", 0),
+            }
+    acc_colls = {}
+    for coll_id, val in (existing.get("collections") or {}).items():
+        acc_colls[coll_id] = {
+            "bytes_transferred": val.get("bytes_transferred", 0),
+            "access_events": val.get("access_events", 0),
+            "unique_ips": val.get("unique_ips", 0),
+            "countries": dict(val.get("countries", {})),
+        }
+    return acc, acc_countries, acc_colls, last_processed
+
+
+def _handle_download(
+    ip, path, ts, nbytes, date_str, is_new_date, acc, acc_countries, acc_colls,
+    daily, last_seen, cutoff_daily, geoip_reader, ip_country_cache
+):
+    """Update accumulators and daily trend for a single /d/ data download line"""
+    coll_match = ACCESS_LOG_FI.match(path)
+    if not coll_match:
+        return
+    coll = coll_match.group(1)
+    key = (ip, path)
+    ts_epoch = ts.timestamp()
+    prev = last_seen.get(key, 0.0)
+    is_new_event = (ts_epoch - prev) > ACCESS_EVENT_WINDOW_SEC
+    last_seen[key] = ts_epoch
+
+    if ts >= cutoff_daily:
+        daily[date_str][coll]["bytes"] += nbytes
+        daily[date_str][coll]["ips"].add(ip)
+
+    if is_new_date:
+        acc["bytes"] += nbytes
+        if coll not in acc_colls:
+            acc_colls[coll] = {
+                "bytes_transferred": 0,
+                "access_events": 0,
+                "unique_ips": 0,
+                "countries": {},
+            }
+        acc_colls[coll]["bytes_transferred"] += nbytes
+
+    country = lookup_country(ip, geoip_reader, ip_country_cache) if geoip_reader else None
+    if country and is_new_date:
+        acc_countries.setdefault(country, {"events": 0, "bytes": 0})
+        acc_countries[country]["bytes"] += nbytes
+
+    if is_new_event:
+        if ts >= cutoff_daily:
+            daily[date_str][coll]["events"] += 1
+        if is_new_date:
+            acc["events"] += 1
+            # approximate: same IP in different periods counted separately
+            acc["ips"] += 1
+            acc_colls[coll]["access_events"] += 1
+            acc_colls[coll]["unique_ips"] += 1
+            if country:
+                acc_countries.setdefault(country, {"events": 0, "bytes": 0})["events"] += 1
+                coll_ctry = acc_colls[coll].setdefault("countries", {})
+                coll_ctry[country] = coll_ctry.get(country, 0) + 1
+
+
+def parse_logs(
+    log_files, acc, acc_countries, acc_colls, last_processed,
+    yesterday, cutoff_daily, geoip_reader, ip_country_cache
+) -> tuple:
+    """Read all log files and update accumulators in place.
+    returns (daily, daily_stac, min_date_seen)"""
+    daily = defaultdict(
+        lambda: defaultdict(
+            lambda: {
+                "bytes": 0,
+                "events": 0,
+                "ips": set(),
+            }
+        )
+    )
+    daily_stac: dict = defaultdict(int)
+    last_seen: dict = {}
+    min_date_seen: Optional[str] = None
+
+    for logfile in log_files:
+        try:
+            with open_log(logfile) as fh:
+                for line in fh:
+                    match = ACCESS_LOG_RE.match(line.rstrip("\n"))
+                    if not match:
+                        continue
+                    ip, ts_raw, req, status_s, bytes_s = match.groups()
+                    status = int(status_s)
+                    if status >= 400:
+                        continue
+                    ts = parse_ts(ts_raw)
+                    if ts is None:
+                        continue
+                    parts = req.split(" ", 2)
+                    if len(parts) < 2:
+                        continue
+                    method, path = parts[0], parts[1]
+                    nbytes = int(bytes_s)
+                    date_str = ts.strftime("%Y-%m-%d")
+
+                    if min_date_seen is None or date_str < min_date_seen:
+                        min_date_seen = date_str
+
+                    is_new_date = date_str > (last_processed or "") and date_str <= yesterday
+                    if path.startswith("/d/"):
+                        _handle_download(
+                            ip, path, ts, nbytes, date_str, is_new_date, acc, acc_countries, acc_colls,
+                            daily, last_seen, cutoff_daily, geoip_reader, ip_country_cache
+                        )
+                    elif path.startswith("/stac/"):
+                        if ts >= cutoff_daily:
+                            daily_stac[date_str] += 1
+                        if is_new_date:
+                            acc["stac"] += 1
+                    elif path.startswith("/reg-api/") and method == "POST" and status == 201:
+                        if is_new_date:
+                            acc["pubs"] += 1
+
+        except Exception as exc:
+            print(f"Warning: could not process {logfile}: {exc}", file=sys.stderr)
+
+    return daily, daily_stac, min_date_seen
+
+
+def build_output(
+    daily, daily_stac, acc, acc_countries, acc_colls, run_dt, yesterday, existing, min_date_seen, stats_folder
+) -> dict:
+    """Assemble the final JSON-serializable result dict"""
+    all_dates = sorted(set(list(daily.keys()) + list(daily_stac.keys())))
+    daily_out = []
+    for date_str in all_dates:
+        entry = {
+            "date": date_str,
+            "stac_queries": daily_stac.get(date_str, 0),
+            "bytes": 0,
+            "access_events": 0,
+            "unique_ips": 0,
+            "collections": {},
+        }
+        for coll, mv in daily.get(date_str, {}).items():
+            entry["collections"][coll] = {
+                "bytes": mv["bytes"],
+                "access_events": mv["events"],
+                "unique_ips": len(mv["ips"]),
+            }
+            entry["bytes"] += mv["bytes"]
+            entry["access_events"] += mv["events"]
+            entry["unique_ips"] += len(mv["ips"])
+        daily_out.append(entry)
+
+    colls_out = {
+        coll: {
+            "bytes_transferred": coll_data["bytes_transferred"],
+            "access_events": coll_data["access_events"],
+            "unique_ips": coll_data["unique_ips"],
+            "countries": dict(
+                sorted(
+                    coll_data.get("countries", {}).items(), key=lambda pair: pair[1], reverse=True
+                )
+            ),
+            "initiative": collection_initiative(stats_folder,coll),
+        }
+        for coll, coll_data in sorted(
+            acc_colls.items(), key=lambda pair: pair[1]["bytes_transferred"], reverse=True
+        )
+    }
+
+    countries_out = {
+        country: {
+            "events": val["events"],
+            "bytes": val["bytes"],
+        }
+        for country, val in sorted(
+            acc_countries.items(), key=lambda pair: pair[1]["events"], reverse=True
+        )
+    }
+
+    return {
+        "generated": run_dt.isoformat(),
+        "last_processed_date": yesterday,
+        "first_collected_date": existing.get("first_collected_date") or min_date_seen,
+        "totals": {
+            "bytes_transferred": acc["bytes"],
+            "access_events": acc["events"],
+            "unique_ips": acc["ips"],
+            "stac_queries": acc["stac"],
+            "publications": acc["pubs"],
+        },
+        "collections": colls_out,
+        "daily_trend": daily_out,
+        "countries": countries_out,
+    }
+
+
+def extract_access_stats(stats_folder):
+    run_dt = datetime.now(timezone.utc)
+    yesterday = (run_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    cutoff_daily = run_dt - timedelta(days=ACCESS_HISTORY_DAYS)
+
+    OUT_FILE=Path(os.path.join(stats_folder,'access_stats.json'))
+    existing: dict = {}
+    if OUT_FILE.exists():
+        try:
+            existing = json.loads(OUT_FILE.read_text())
+        except Exception:
+            pass
+
+    acc, acc_countries, acc_colls, last_processed = load_state(existing)
+
+    geoip_reader = None
+    if _GEOIP and os.path.exists(GEOIP_DB):
+        geoip_reader = _geoip_mod.open(str(GEOIP_DB), _geoip_mod.GEOIP_MEMORY_CACHE)
+    else:
+        log("WARNING: GeoIP database not available - country lookup disabled")
+    ip_country_cache: dict = {}
+
+    log_files = sorted(Path(ACCESS_LOG_DIR).glob(ACCESS_LOG_PATTERN), key=log_sort_key)
+    if not log_files:
+        log(f"WARNING: No log files found matching {ACCESS_LOG_DIR} / {ACCESS_LOG_PATTERN}")
+
+    daily, daily_stac, min_date_seen = parse_logs(
+        log_files, acc, acc_countries, acc_colls, last_processed,
+        yesterday, cutoff_daily, geoip_reader, ip_country_cache
+    )
+
+    result = build_output(
+        daily, daily_stac, acc, acc_countries, acc_colls,
+        run_dt, yesterday, existing, min_date_seen, stats_folder
+    )
+
+    tmp = OUT_FILE.with_name(OUT_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(result, indent=2))
+    tmp.replace(OUT_FILE)
+    OUT_FILE.chmod(0o644)
+    log(
+        f"Written {OUT_FILE} - "
+        f"{acc['events']} access events (total), {acc['ips']} unique IPs (approx), "
+        f"{acc['stac']} STAC queries, {acc['pubs']} publications"
+    )
+
+
+### Collection statistics and integrity checks routines
+###
 
 def verify_multihash(filepath,multihash):
   # Multihash format: <hash code><digest length><digest>
@@ -441,6 +777,7 @@ class check_params_struct:
     fix_checksum_mismatch=False
     fix_missing_type=False
     skip_checksum_checks=False
+    skip_collection_stats=False
 
 check_params=check_params_struct()
 
@@ -760,6 +1097,7 @@ parser_status = subparsers.add_parser('status', help='Check deamon status.')
 parser_status.set_defaults(command='status')
 parser_run = subparsers.add_parser('run', help='Run in standalone mode. Good for testing, debug and fixing operations')
 parser_run.set_defaults(command='run')
+parser_run.add_argument('--skip-collection-stats', action='store_true', help='Skip collection statistics retreival and run only access statistics retreival')
 parser_run.add_argument('--skip-checksum-checks', action='store_true', help='Skip checksum checks. Useful to speed-up analysis when you have to quickly fix issues.')
 parser_run.add_argument('--fix-script-prefix', type=str, default='metadata', metavar='<prefix>', help='Prefix for the generated fix scripts. Defaults to the local folder')
 parser_run.add_argument('--fix-missing-size', action='store_true', help='Fix missing file:size metadata, set it to current file size from disk. USE WITH CAUTION!')
@@ -802,6 +1140,7 @@ elif args.command == "run":
   check_params.fix_checksum_mismatch=args.fix_checksum_mismatch
   check_params.fix_missing_type=args.fix_missing_type
   check_params.skip_checksum_checks=args.skip_checksum_checks
+  check_params.skip_collection_stats=args.skip_collection_stats
   #Force single run
   run_job(args.colls)
   #Check if fixes are applied
